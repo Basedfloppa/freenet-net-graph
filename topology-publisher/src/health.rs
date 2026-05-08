@@ -118,14 +118,30 @@ async fn handle_one(
         HealthSnapshot::now_secs().saturating_sub(snap.last_publish_unix)
     };
 
-    let (status, body) = if path == "/healthz" || path == "/healthz/" {
-        ("200 OK", serde_json::to_string(&snap).unwrap_or_default())
-    } else {
-        ("404 Not Found", "not found".to_string())
+    let (status, content_type, body) = match path {
+        "/healthz" | "/healthz/" => (
+            "200 OK",
+            "application/json",
+            serde_json::to_string(&snap).unwrap_or_default(),
+        ),
+        "/metrics" | "/metrics/" => (
+            "200 OK",
+            "text/plain; version=0.0.4",
+            render_prometheus(&snap),
+        ),
+        "/" | "" => (
+            "200 OK",
+            "text/plain; charset=utf-8",
+            "topology-publisher health endpoint\n\
+             /healthz  - JSON snapshot\n\
+             /metrics  - Prometheus text exposition\n"
+                .to_string(),
+        ),
+        _ => ("404 Not Found", "text/plain", "not found".to_string()),
     };
     let resp = format!(
         "HTTP/1.1 {status}\r\n\
-         Content-Type: application/json\r\n\
+         Content-Type: {content_type}\r\n\
          Content-Length: {len}\r\n\
          Connection: close\r\n\
          \r\n\
@@ -134,6 +150,80 @@ async fn handle_one(
     );
     stream.write_all(resp.as_bytes()).await?;
     Ok(())
+}
+
+/// Render the snapshot in the Prometheus text exposition format
+/// (version 0.0.4). One gauge per snapshot field, plus a build-info
+/// metric so a scraper can join versions across upgrades. We don't
+/// include counters because the daemon doesn't accumulate over its
+/// lifetime — every gauge is "last cycle's value".
+fn render_prometheus(snap: &HealthSnapshot) -> String {
+    let mut s = String::with_capacity(1024);
+    let metric = |s: &mut String, name: &str, help: &str, value: u64| {
+        s.push_str("# HELP ");
+        s.push_str(name);
+        s.push(' ');
+        s.push_str(help);
+        s.push('\n');
+        s.push_str("# TYPE ");
+        s.push_str(name);
+        s.push_str(" gauge\n");
+        s.push_str(name);
+        s.push(' ');
+        s.push_str(&value.to_string());
+        s.push('\n');
+    };
+    metric(
+        &mut s,
+        "topology_publisher_last_publish_unix_seconds",
+        "Unix timestamp of the last successful publish; 0 if none yet.",
+        snap.last_publish_unix,
+    );
+    metric(
+        &mut s,
+        "topology_publisher_seconds_since_last_publish",
+        "Seconds elapsed since the last successful publish.",
+        snap.last_publish_secs_ago,
+    );
+    metric(
+        &mut s,
+        "topology_publisher_session_alive",
+        "1 when a WebSocket session is live, 0 during reconnect-backoff.",
+        snap.session_alive as u64,
+    );
+    metric(
+        &mut s,
+        "topology_publisher_last_peer_count",
+        "Peer count in the most-recent published payload.",
+        snap.last_peer_count as u64,
+    );
+    metric(
+        &mut s,
+        "topology_publisher_last_contract_count",
+        "Contract count in the most-recent published payload.",
+        snap.last_contract_count as u64,
+    );
+    metric(
+        &mut s,
+        "topology_publisher_last_webapp_count",
+        "Number of contracts in the last payload that the local probe \
+         classified as webapps.",
+        snap.last_webapp_count as u64,
+    );
+    metric(
+        &mut s,
+        "topology_publisher_probed_total",
+        "Total number of contract keys currently held in the probe cache \
+         (probed at least once since startup or reconnect).",
+        snap.probed_total as u64,
+    );
+    s.push_str("# HELP topology_publisher_build_info Static info about the running publisher build.\n");
+    s.push_str("# TYPE topology_publisher_build_info gauge\n");
+    s.push_str(&format!(
+        "topology_publisher_build_info{{version=\"{}\"}} 1\n",
+        env!("CARGO_PKG_VERSION")
+    ));
+    s
 }
 
 /// Send a `WATCHDOG=1` notification to systemd, if `$NOTIFY_SOCKET` is

@@ -22,6 +22,34 @@ enum ItemKind {
     Contract,
 }
 
+/// One sample for the header sparkline. Cheap to clone (16 bytes).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HistorySample {
+    ts: u64,
+    publishers: u32,
+    edges: u32,
+    nodes: u32,
+}
+
+/// Capacity of the rolling sparkline buffer. ~60 samples ≈ 1 hour at the
+/// daemon's default 60 s publish cadence — long enough to spot a slow
+/// drift, short enough that the SVG stays readable at 80 px wide.
+const HISTORY_CAP: usize = 60;
+
+/// Convert a `ws://host:port` (or `wss://`) URL to the equivalent
+/// `http://host:port` base. Returns `None` for non-ws schemes — the
+/// caller should treat that as "can't open contract URL from here".
+fn ws_to_http_base(ws: &str) -> Option<String> {
+    let trimmed = ws.trim().trim_end_matches('/');
+    if let Some(rest) = trimmed.strip_prefix("wss://") {
+        Some(format!("https://{rest}"))
+    } else if let Some(rest) = trimmed.strip_prefix("ws://") {
+        Some(format!("http://{rest}"))
+    } else {
+        None
+    }
+}
+
 #[function_component(App)]
 fn app() -> Html {
     // ---- persistent state, hydrated from localStorage ----------------
@@ -129,6 +157,12 @@ fn app() -> Html {
     // ([topology-publisher]) write into the contract; visitors here
     // never sign or publish anything.
     let topo = Rc::new(build_topology(&remote_entries, &settings.known_nodes));
+
+    // Rolling history of (timestamp, publisher_count, peer_edge_count)
+    // for the header sparkline. Bounded to HISTORY_CAP so the buffer
+    // stays cheap. Only sampled when `topo.fetched_at` advances —
+    // empty topologies don't pollute the line.
+    let history: UseStateHandle<Vec<HistorySample>> = use_state(Vec::new);
     // Selection-driven highlight set: which graph node ids should stay
     // at full opacity. None = no selection / no match → default render.
     let highlight_set: Rc<Option<HashSet<String>>> = Rc::new(compute_highlight_set(
@@ -143,7 +177,7 @@ fn app() -> Html {
         _ => None,
     };
 
-    let (header_meta, publisher_count) = {
+    let (header_meta, publisher_count, total_peer_edges, unique_node_count) = {
         let t: &Topology = &topo;
         let total_peers: usize = t.gateways.iter().map(|g| g.peers.len()).sum();
         let nodes = flat_nodes(t);
@@ -157,8 +191,54 @@ fn app() -> Html {
             nodes.len(),
             contracts.len(),
         );
-        (meta, publishers)
+        (meta, publishers, total_peers, nodes.len())
     };
+
+    // Sample the rolling history once per `fetched_at` advance. Pushing
+    // every render would explode the buffer; gating on the deduplicated
+    // (ts, publishers, edges, nodes) tuple ensures we only keep frames
+    // that actually changed. `use_effect_with` debounces dependency
+    // changes for us.
+    {
+        let history = history.clone();
+        let fetched_at = topo.fetched_at;
+        let publishers = publisher_count as u32;
+        let edges = total_peer_edges as u32;
+        let nodes = unique_node_count as u32;
+        use_effect_with(
+            (fetched_at, publishers, edges, nodes),
+            move |&(ts, p, e, n)| {
+                // Skip the empty-topology start-of-day so the line doesn't
+                // anchor at zero forever.
+                if ts == 0 {
+                    return;
+                }
+                let mut next = (*history).clone();
+                if next.last().map(|s| s.ts == ts).unwrap_or(false) {
+                    return;
+                }
+                next.push(HistorySample {
+                    ts,
+                    publishers: p,
+                    edges: e,
+                    nodes: n,
+                });
+                if next.len() > HISTORY_CAP {
+                    let drop = next.len() - HISTORY_CAP;
+                    next.drain(..drop);
+                }
+                history.set(next);
+            },
+        );
+    }
+
+    // HTTP base URL used to construct webapp open-links. The dashboard
+    // runs inside the sandboxed iframe at the opaque "null" origin, so
+    // relative URLs would resolve to `null` — we derive the outer
+    // freenet node's HTTP base from the configured WS URL instead.
+    // `Rc<Option<String>>` so the value is cheap to clone into every
+    // contract-row render (one alloc per topology change, not per row).
+    let http_base: Rc<Option<String>> = Rc::new(ws_to_http_base(&settings.contract.node_ws_url));
 
     // ---- callbacks ---------------------------------------------------
     let on_search_input = {
@@ -259,6 +339,7 @@ fn app() -> Html {
             <header>
                 <h1>{"Freenet "}<span class="accent">{"net-graph"}</span></h1>
                 <div class="meta">{ header_meta }</div>
+                { render_header_sparklines(&history) }
                 <button class="header-btn" onclick={toggle_drawer.clone()} title="Settings">{"⚙"}</button>
             </header>
             <main style={main_grid_style}>
@@ -280,6 +361,7 @@ fn app() -> Html {
                             select_node.clone(),
                             on_copy.clone(),
                             last_copied_value.as_deref(),
+                            http_base.clone(),
                         )
                     }
                 </aside>
@@ -293,6 +375,18 @@ fn app() -> Html {
                         highlight_set={highlight_set.clone()}
                         layout={layout}
                     />
+                    {
+                        match selected.as_deref() {
+                            Some(sel) => render_publisher_drilldown(
+                                &remote_entries,
+                                sel,
+                                on_copy.clone(),
+                                last_copied_value.as_deref(),
+                                http_base.clone(),
+                            ),
+                            None => html!{},
+                        }
+                    }
                     {
                         if publisher_count == 0 {
                             // No verified entries from the contract yet —
@@ -890,6 +984,280 @@ fn render_ring_histogram(t: &Topology) -> Html {
     }
 }
 
+// ============================ header sparklines ============================
+
+/// Render two compact SVG sparklines side by side: peer-edge count and
+/// publisher count over the recent past (`HISTORY_CAP` samples). Empty
+/// or single-sample history collapses to a flat line — never a layout-
+/// shifting blank, since the header has fixed slot width.
+fn render_header_sparklines(history: &[HistorySample]) -> Html {
+    if history.is_empty() {
+        return html! {
+            <div class="header-sparklines" title="awaiting first publish">
+                <div class="sparkline-empty">{"—"}</div>
+            </div>
+        };
+    }
+
+    let edges_max = history.iter().map(|s| s.edges).max().unwrap_or(1).max(1);
+    let pubs_max = history.iter().map(|s| s.publishers).max().unwrap_or(1).max(1);
+
+    let edges_path = sparkline_path(history, edges_max, |s| s.edges);
+    let pubs_path = sparkline_path(history, pubs_max, |s| s.publishers);
+
+    let last = history.last().copied().unwrap_or(HistorySample {
+        ts: 0,
+        publishers: 0,
+        edges: 0,
+        nodes: 0,
+    });
+
+    html! {
+        <div class="header-sparklines"
+             title={format!(
+                "last {} sample(s) • now: {} edges, {} pubs",
+                history.len(), last.edges, last.publishers
+             )}>
+            <div class="sparkline" title="peer-edge count over time">
+                <svg viewBox="0 0 80 20" preserveAspectRatio="none">
+                    <path d={edges_path} class="sparkline-edges" />
+                </svg>
+                <span class="sparkline-label">{ format!("{} edges", last.edges) }</span>
+            </div>
+            <div class="sparkline" title="publisher count over time">
+                <svg viewBox="0 0 80 20" preserveAspectRatio="none">
+                    <path d={pubs_path} class="sparkline-pubs" />
+                </svg>
+                <span class="sparkline-label">{ format!("{} pubs", last.publishers) }</span>
+            </div>
+        </div>
+    }
+}
+
+/// Build a polyline `d=` attribute from `history` using `extract` to
+/// pluck the value out of each sample. Y axis is inverted (SVG origin
+/// is top-left) and scaled so the peak hits y=2 (small top margin).
+fn sparkline_path(history: &[HistorySample], max: u32, extract: impl Fn(&HistorySample) -> u32) -> String {
+    let n = history.len();
+    if n == 0 {
+        return String::new();
+    }
+    let max_f = max.max(1) as f64;
+    let dx = if n > 1 { 80.0 / (n - 1) as f64 } else { 0.0 };
+    let mut d = String::with_capacity(16 * n);
+    for (i, s) in history.iter().enumerate() {
+        let x = i as f64 * dx;
+        // y in [2..18]; pad 2px top + bottom so the stroke isn't clipped.
+        let y = 18.0 - (extract(s) as f64 / max_f) * 16.0;
+        let cmd = if i == 0 { "M" } else { "L" };
+        if i > 0 {
+            d.push(' ');
+        }
+        d.push_str(&format!("{cmd}{x:.1},{y:.1}"));
+    }
+    d
+}
+
+// ============================ publisher drilldown ============================
+
+/// If `selected` corresponds to a publisher we have a verified
+/// `RemoteEntry` for, render an absolutely-positioned card on the graph
+/// canvas with the publisher's full identity (pubkey, version, location,
+/// peer/contract counts, last seen). Returns `html!{}` when the
+/// selection is a non-publisher node (e.g. a transitive peer).
+fn render_publisher_drilldown(
+    remote: &HashMap<String, RemoteEntry>,
+    selected: &str,
+    on_copy: Callback<String>,
+    last_copied: Option<&str>,
+    http_base: Rc<Option<String>>,
+) -> Html {
+    let Some(entry) = find_remote_entry_for_selection(remote, selected) else {
+        return html! {};
+    };
+    let p = &entry.payload;
+    let pubkey = entry.publisher_pubkey_hex.clone();
+    let pubkey_short: String = pubkey.chars().take(16).collect();
+    let now_ms = web_sys::js_sys::Date::now() as u64;
+    let age_ms = now_ms.saturating_sub(p.timestamp_ms);
+    let age = format_ago_ms(age_ms);
+    let stale = age_ms > 5 * 60 * 1000;
+
+    let location_str = p
+        .own_location
+        .map(|l| format!("{l:.4}"))
+        .unwrap_or_else(|| "—".into());
+    let version_str = p.version.clone().unwrap_or_else(|| "—".into());
+    let address_str = if p.external_address.is_empty() {
+        "—".to_string()
+    } else {
+        p.external_address.clone()
+    };
+
+    let webapp_count = p
+        .contracts
+        .iter()
+        .filter(|raw| {
+            let (_, w, _) = shared::contract::decode_contract_entry(raw);
+            w == Some(true)
+        })
+        .count();
+
+    // Top-3 contracts by title presence (webapps with names first), with
+    // a "↗ open" link for each webapp. Covers the common case of "what
+    // is this node hosting?" without bloating the panel for nodes that
+    // host hundreds of contracts.
+    let mut sorted_contracts: Vec<(String, Option<bool>, Option<String>)> = p
+        .contracts
+        .iter()
+        .map(|raw| shared::contract::decode_contract_entry(raw))
+        .collect();
+    sorted_contracts.sort_by(|a, b| {
+        let bucket = |c: &(String, Option<bool>, Option<String>)| match c.1 {
+            Some(true) => 0,
+            None => 1,
+            Some(false) => 2,
+        };
+        bucket(a)
+            .cmp(&bucket(b))
+            .then_with(|| a.2.as_deref().unwrap_or("").cmp(b.2.as_deref().unwrap_or("")))
+    });
+    let preview: Vec<Html> = sorted_contracts
+        .iter()
+        .take(8)
+        .map(|(key, w, title)| {
+            let label = title
+                .clone()
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| {
+                    let short: String = key.chars().take(12).collect();
+                    format!("{short}…")
+                });
+            let badge = match w {
+                Some(true) => html! { <span class="web-badge web-yes">{"✓"}</span> },
+                Some(false) => html! { <span class="web-badge web-no">{"d"}</span> },
+                None => html! {},
+            };
+            // `<a target="_blank">` rather than a button: lets the
+            // browser handle every native open-in-new-tab gesture
+            // (left-click / middle-click / ctrl/cmd+click / right-click
+            // → "Open in new tab") without us implementing each one in
+            // JS. `stop_propagation` keeps a stray click off the link
+            // itself from bubbling up to the row's selection handler.
+            let open_btn = match (*w, http_base.as_ref()) {
+                (Some(true), Some(base)) => {
+                    let url = format!("{base}/v1/contract/web/{key}/");
+                    let stop = Callback::from(|e: MouseEvent| e.stop_propagation());
+                    html! {
+                        <a class="contract-open-btn"
+                           href={url}
+                           target="_blank"
+                           rel="noopener noreferrer"
+                           title="open webapp"
+                           onclick={stop.clone()}
+                           onauxclick={stop}>{"↗"}</a>
+                    }
+                }
+                _ => html! {},
+            };
+            html! {
+                <div class="drilldown-contract">
+                    { badge }
+                    <span class="drilldown-contract-label">{ label }</span>
+                    { open_btn }
+                </div>
+            }
+        })
+        .collect();
+
+    html! {
+        <div class="publisher-drilldown">
+            <div class="drilldown-head">
+                <span class="drilldown-title">{"publisher"}</span>
+                {
+                    if stale {
+                        html! { <span class="row-tag row-tag-stale" title="no fresh entry in >5 min">{"stale"}</span> }
+                    } else { html! {} }
+                }
+                <span class="drilldown-age">{ age }</span>
+            </div>
+            <div class="drilldown-row">
+                <span class="drilldown-key">{"pubkey"}</span>
+                <span class="drilldown-val mono" title={pubkey.clone()}>{ format!("{pubkey_short}…") }</span>
+                { copy_button(pubkey.clone(), on_copy.clone(), last_copied) }
+            </div>
+            <div class="drilldown-row">
+                <span class="drilldown-key">{"address"}</span>
+                <span class="drilldown-val mono">{ address_str }</span>
+            </div>
+            <div class="drilldown-row">
+                <span class="drilldown-key">{"location"}</span>
+                <span class="drilldown-val">{ location_str }</span>
+                <span class="drilldown-key">{"version"}</span>
+                <span class="drilldown-val">{ version_str }</span>
+            </div>
+            <div class="drilldown-row">
+                <span class="drilldown-key">{"peers"}</span>
+                <span class="drilldown-val">{ p.neighbors.len() }</span>
+                <span class="drilldown-key">{"contracts"}</span>
+                <span class="drilldown-val">
+                    { p.contracts.len() }
+                    {
+                        if webapp_count > 0 {
+                            html! { <span class="drilldown-sub">{ format!(" ({webapp_count} web)") }</span> }
+                        } else { html! {} }
+                    }
+                </span>
+            </div>
+            {
+                if preview.is_empty() {
+                    html! {}
+                } else {
+                    html! {
+                        <div class="drilldown-contracts">
+                            <div class="drilldown-key">{"hosted (top 8)"}</div>
+                            { for preview }
+                        </div>
+                    }
+                }
+            }
+        </div>
+    }
+}
+
+/// Reverse-lookup: turn a graph node id back into the `RemoteEntry`
+/// that synthesised it, mirroring the same id derivation
+/// `build_topology` uses. Returns `None` when the selection is a
+/// transitive peer (no direct entry) or a known-node anchor.
+fn find_remote_entry_for_selection<'a>(
+    remote: &'a HashMap<String, RemoteEntry>,
+    selected: &str,
+) -> Option<&'a RemoteEntry> {
+    remote.values().find(|e| {
+        let pubkey_prefix: String = e.publisher_pubkey_hex.chars().take(8).collect();
+        let synth_label = format!("remote: {pubkey_prefix}");
+        let gw_id = if e.payload.external_address.is_empty() {
+            format!("gw::{synth_label}")
+        } else {
+            e.payload.external_address.clone()
+        };
+        gw_id == selected
+    })
+}
+
+fn format_ago_ms(ms: u64) -> String {
+    let secs = ms / 1000;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h{}m ago", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 // ============================ search panel + rows ============================
 
 #[allow(clippy::too_many_arguments)]
@@ -904,6 +1272,7 @@ fn render_search_panel(
     on_pick: Callback<String>,
     on_copy: Callback<String>,
     last_copied: Option<&str>,
+    http_base: Rc<Option<String>>,
 ) -> Html {
     let nodes = flat_nodes(t);
     let contracts = flat_contracts(t);
@@ -975,7 +1344,7 @@ fn render_search_panel(
                     if items.is_empty() {
                         html! { <p class="empty">{"no matches"}</p> }
                     } else {
-                        items.iter().map(|it| render_list_row(it, selected, on_pick.clone(), on_copy.clone(), last_copied)).collect::<Html>()
+                        items.iter().map(|it| render_list_row(it, selected, on_pick.clone(), on_copy.clone(), last_copied, http_base.clone())).collect::<Html>()
                     }
                 }
             </div>
@@ -989,10 +1358,11 @@ fn render_list_row(
     on_pick: Callback<String>,
     on_copy: Callback<String>,
     last_copied: Option<&str>,
+    http_base: Rc<Option<String>>,
 ) -> Html {
     match item.kind {
         ItemKind::Node => render_node_row(item.node.as_ref().unwrap(), selected, on_pick, on_copy, last_copied),
-        ItemKind::Contract => render_contract_row(item.contract.as_ref().unwrap(), selected, on_pick, on_copy, last_copied),
+        ItemKind::Contract => render_contract_row(item.contract.as_ref().unwrap(), selected, on_pick, on_copy, last_copied, http_base),
     }
 }
 
@@ -1086,11 +1456,40 @@ fn render_contract_row(
     on_pick: Callback<String>,
     on_copy: Callback<String>,
     last_copied: Option<&str>,
+    http_base: Rc<Option<String>>,
 ) -> Html {
     let is_selected = selected == Some(c.key.as_str());
     let row_class = classes!("node-row", is_selected.then_some("selected"));
     let id = c.key.clone();
     let onclick = Callback::from(move |_: MouseEvent| on_pick.emit(id.clone()));
+    // Webapp open URL — built once per row when both ws→http base
+    // resolved and the contract is a confirmed webapp. `None` disables
+    // both the "↗" link and the row's middle-click open gesture.
+    let webapp_url: Option<String> = match (c.has_web_interface, http_base.as_ref()) {
+        (Some(true), Some(base)) => Some(format!("{base}/v1/contract/web/{}/", c.key)),
+        _ => None,
+    };
+    // Middle-click anywhere on a webapp row opens it in a new tab.
+    // Mirrors the browser-native middle-click-on-link gesture so users
+    // don't have to aim at the small "↗" target. `auxclick` fires on
+    // *any* non-primary mouse button — gate on `button == 1` (middle)
+    // so right-click still gets the standard context menu.
+    let onauxclick = match webapp_url.as_ref() {
+        Some(url) => {
+            let url = url.clone();
+            Callback::from(move |e: MouseEvent| {
+                if e.button() != 1 {
+                    return;
+                }
+                e.prevent_default();
+                e.stop_propagation();
+                if let Some(window) = web_sys::window() {
+                    let _ = window.open_with_url_and_target(&url, "_blank");
+                }
+            })
+        }
+        None => Callback::noop(),
+    };
     let seen = if c.seen_by.is_empty() { String::new() } else { format!("via {}", c.seen_by.join(", ")) };
     let web_badge = match c.has_web_interface {
         Some(true) => Some(("web-badge web-yes", "✓ web")),
@@ -1108,7 +1507,7 @@ fn render_contract_row(
         c.key.clone()
     };
     html! {
-        <div class={row_class} onclick={onclick}>
+        <div class={row_class} onclick={onclick} onauxclick={onauxclick}>
             <span class="hue-dot" style="background: #14b8a6;"></span>
             <div class="row-text">
                 <div class="row-main">
@@ -1129,6 +1528,27 @@ fn render_contract_row(
                     { if !seen.is_empty() { html! { <span>{" • "}{ seen }</span> } } else { html!{} } }
                 </div>
             </div>
+            {
+                // `<a target="_blank">` — browser handles every native
+                // open-in-new-tab gesture (left/middle/ctrl+click,
+                // right-click → "Open in new tab") with no extra JS.
+                // `stop_propagation` keeps clicks on the link itself
+                // from also triggering the row's selection handler.
+                if let Some(url) = webapp_url.as_ref() {
+                    let stop = Callback::from(|e: MouseEvent| e.stop_propagation());
+                    html! {
+                        <a class="contract-open-btn"
+                           href={url.clone()}
+                           target="_blank"
+                           rel="noopener noreferrer"
+                           title="open webapp in new tab"
+                           onclick={stop.clone()}
+                           onauxclick={stop}>{"↗"}</a>
+                    }
+                } else {
+                    html! {}
+                }
+            }
             { copy_button(c.key.clone(), on_copy, last_copied) }
         </div>
     }

@@ -387,6 +387,149 @@ line.edge-dimmed   { opacity: 0.06; transition: opacity 200ms ease; }
     background: rgba(74, 222, 128, 0.12);
 }
 
+/* "↗" open-webapp button on contract rows + drilldown contracts. Mirrors
+   the copy-btn shape so the row's right side stays visually consistent
+   when both buttons are present. */
+.contract-open-btn {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    margin-top: 2px;
+    margin-left: 6px;
+    background: transparent;
+    border: 1px solid var(--panel-border);
+    color: var(--fg-muted);
+    border-radius: 4px;
+    padding: 2px 6px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 1;
+    transition: color 100ms, border-color 100ms, background 100ms;
+}
+.node-row:hover .contract-open-btn { color: var(--fg); border-color: var(--fg-muted); }
+.contract-open-btn:hover { color: var(--accent); border-color: var(--accent); background: rgba(247, 140, 31, 0.08); }
+
+/* Header sparklines: two compact SVG strips between the meta line and
+   the gear button. Each strip is 80px wide so the header keeps a stable
+   layout regardless of sample count. Stroke colours match the legend
+   semantics (gateway-orange for publishers, accent-blue for edges). */
+.header-sparklines {
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex: 0 0 auto;
+}
+.sparkline {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    line-height: 1;
+}
+.sparkline svg {
+    width: 80px;
+    height: 20px;
+    display: block;
+    overflow: visible;
+}
+.sparkline-edges { fill: none; stroke: #6ea8ff; stroke-width: 1.4px; vector-effect: non-scaling-stroke; }
+.sparkline-pubs  { fill: none; stroke: var(--gateway, #f78c1f); stroke-width: 1.4px; vector-effect: non-scaling-stroke; }
+.sparkline-label {
+    font-size: 10px;
+    color: var(--fg-muted);
+    margin-top: 2px;
+    white-space: nowrap;
+}
+.sparkline-empty {
+    width: 80px;
+    height: 20px;
+    color: var(--fg-muted);
+    font-size: 11px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* Publisher drilldown — a floating card on the graph canvas that pops
+   up when the user selects a publisher (gateway with a remote entry).
+   Top-right placement keeps the graph centre clear; max-width guards
+   against long contract titles blowing out the layout. */
+.publisher-drilldown {
+    position: absolute;
+    top: 12px;
+    right: 12px;
+    width: 320px;
+    max-height: calc(100% - 24px);
+    overflow-y: auto;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    color: var(--fg);
+    font-size: 12px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+    z-index: 5;
+}
+.drilldown-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--panel-border);
+}
+.drilldown-title {
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+    font-size: 11px;
+    color: var(--fg-muted);
+}
+.drilldown-age { margin-left: auto; color: var(--fg-muted); font-size: 11px; }
+.drilldown-row {
+    display: grid;
+    grid-template-columns: 70px 1fr auto;
+    gap: 6px 8px;
+    align-items: center;
+    margin: 4px 0;
+}
+.drilldown-row .drilldown-key:nth-child(3) {
+    grid-column: 1 / 2;
+}
+.drilldown-key {
+    color: var(--fg-muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+}
+.drilldown-val {
+    font-size: 12px;
+    color: var(--fg);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.drilldown-val.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.drilldown-sub { color: var(--fg-muted); font-size: 11px; }
+.drilldown-contracts {
+    margin-top: 8px;
+    padding-top: 6px;
+    border-top: 1px solid var(--panel-border);
+}
+.drilldown-contract {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 0;
+    font-size: 11px;
+}
+.drilldown-contract-label {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.publisher-drilldown .row-tag-stale { font-size: 10px; }
+
 /* Settings gear button in the header. */
 .header-btn {
     background: transparent;

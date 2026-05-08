@@ -37,11 +37,15 @@ ed25519-dalek = { version = "2", default-features = false, features = ["alloc", 
 # this on the response.
 scraper-lib = { path = "../scraper" }
 bs58 = "0.5"
-# Browser-side client for the freenet-core WebSocket API: gives us
-# `client_api::WebApi` (the wasm32 variant uses `web_sys::WebSocket`)
-# plus `ClientRequest` / `HostResponse` types. The `net` feature is
+# Browser-side wire types for the freenet-core WebSocket API:
+# `ClientRequest`, `HostResponse`, `Error`, `ContractKey`, etc. The
+# WS lifecycle itself is handled by our own `crate::ws_shim` —
+# stdlib's `client_api::WebApi` is bypassed because in null-origin
+# sandbox iframes its Blob+FileReader path silently drops binary
+# frames (see `src/ws_shim.rs` module docs). The `net` feature is
 # target-gated in stdlib's Cargo.toml, so on wasm32 we get only the
 # wasm-bindgen / web-sys / js-sys deps without tokio.
+#
 # Use the crates.io-published 0.6.1 to match the wire format spoken by
 # freenet-core nodes built from `freenet-stdlib = "0.6.1"`. The local
 # 0.7.0 path-dep introduced bincode-incompatible enum variants in
@@ -51,13 +55,3 @@ bs58 = "0.5"
 freenet-stdlib = { version = "0.6.1", features = ["net"] }
 web-sys = { version = "0.3", features = ["HtmlInputElement", "HtmlSelectElement", "Navigator", "Clipboard", "Storage", "WebSocket"] }
 base64 = "0.22.1"
-
-# Override stdlib 0.6.1 with a locally-patched copy that switches the
-# browser-side WebApi to receive ArrayBuffer instead of Blob+FileReader.
-# Inside a sandboxed iframe (opaque "null" origin) the FileReader path
-# never delivered the SubscribeResponse / UpdateResult frames, leaving
-# the dashboard stuck at "subscribing…" and silently dropping outgoing
-# Updates. Switching to an arraybuffer binaryType receives bytes
-# synchronously on the message event and avoids the FileReader detour.
-[patch.crates-io]
-freenet-stdlib = { path = "../stdlib-0.6.1-patched" }

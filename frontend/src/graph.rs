@@ -25,6 +25,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
+
 use gloo_timers::callback::Interval;
 use shared::Topology;
 use yew::prelude::*;
@@ -43,22 +44,28 @@ struct PhysNode {
     label: String,
     is_gateway: bool,
     is_public_default: bool,
-    /// True for the user's own publisher entry. The graph draws a
-    /// distinct ring + "you" tag so the user can find themselves
-    /// without scanning the gateway labels. Set per-render from
-    /// `GraphProps.self_node_id`, not stored across syncs (the seed
-    /// can change between renders).
-    is_self: bool,
     /// Whether the node has a known ring location (used purely as colour
     /// input now — geometry is location-agnostic).
     has_location: bool,
     /// `location ∈ [0, 1)`, if known. Drives fill hue.
     location: Option<f64>,
+    /// Wall-clock ms when the publisher behind this node last reposted.
+    /// `None` for transitive peers (no direct timestamp). Drives the
+    /// stale-publisher fade so the user can tell which gateways are
+    /// actively reporting vs. silent.
+    last_seen_ms: Option<u64>,
     x: f64,
     y: f64,
     vx: f64,
     vy: f64,
 }
+
+/// Publisher entries older than this are rendered faded ("stale"). Five
+/// minutes ≈ five publish cycles at the daemon's default 60 s interval,
+/// so a single missed heartbeat doesn't trigger; only a sustained
+/// silence does. Browser-publish (skeleton) ticks once per
+/// settings-save, which is also typically well under this threshold.
+const STALE_AFTER_MS: u64 = 5 * 60 * 1000;
 
 impl PhysNode {
     fn new(id: String, label: String, is_gateway: bool, location: Option<f64>) -> Self {
@@ -78,9 +85,9 @@ impl PhysNode {
             label,
             is_gateway,
             is_public_default: false,
-            is_self: false,
             has_location: location.is_some(),
             location,
+            last_seen_ms: None,
             x: CENTER + seed_r * seed_a.cos(),
             y: CENTER + seed_r * seed_a.sin(),
             vx: 0.0,
@@ -123,9 +130,20 @@ impl LayoutState {
                         n.location = gw.own_location;
                         n.has_location = true;
                     }
+                    // Always adopt the freshest publish timestamp —
+                    // staleness is the freshness of the *most recent*
+                    // report, not the first one we saw.
+                    if let Some(ts) = gw.last_seen_ms {
+                        n.last_seen_ms = Some(
+                            n.last_seen_ms.map_or(ts, |cur| cur.max(ts)),
+                        );
+                    }
                 })
                 .or_insert_with(|| {
-                    PhysNode::new(gw_id.clone(), gw.label.clone(), true, gw.own_location)
+                    let mut node =
+                        PhysNode::new(gw_id.clone(), gw.label.clone(), true, gw.own_location);
+                    node.last_seen_ms = gw.last_seen_ms;
+                    node
                 });
 
             for peer in &gw.peers {
@@ -311,11 +329,14 @@ pub struct GraphProps {
     /// search list.
     #[prop_or_default]
     pub selected: Option<String>,
-    /// Graph-node id of the user's own publisher entry. When set, that
-    /// node renders with a coloured ring and a "you" tag so the user can
-    /// spot themselves on the graph at a glance.
+    /// Optional focus set of graph node ids derived from the current
+    /// selection: clicking a publisher highlights its 1-hop ring,
+    /// clicking a contract highlights every publisher that hosts it.
+    /// When `Some`, anything *outside* the set dims; `None` renders all
+    /// nodes/edges at full opacity. `Rc` because the parent recomputes
+    /// it per render and we want cheap clones, not deep copies.
     #[prop_or_default]
-    pub self_node_id: Option<String>,
+    pub highlight_set: Rc<Option<HashSet<String>>>,
     /// User-tunable physics constants. Read every tick; changing them in
     /// the settings drawer rebalances the layout in real time without a
     /// full re-render.
@@ -359,17 +380,16 @@ pub fn graph(props: &GraphProps) -> Html {
         });
     }
 
-    // Refresh `is_self` flags every render: the prop can change (user
-    // toggles publish, regenerates seed, switches identity) without a
-    // topology resync, and we don't want the marker to lag behind.
-    {
-        let mut l = layout.borrow_mut();
-        let self_id = props.self_node_id.as_deref();
-        for n in l.nodes.values_mut() {
-            n.is_self = self_id == Some(n.id.as_str());
-        }
-    }
     let l = layout.borrow();
+
+    // Dimming gate: when a focus set is active, anything *not* in the
+    // set fades. Edges fade unless *both* endpoints are in focus —
+    // edges across the boundary are arguably interesting but they
+    // visually clutter the focused subgraph.
+    let focus: Option<&HashSet<String>> = match props.highlight_set.as_ref() {
+        Some(set) if !set.is_empty() => Some(set),
+        _ => None,
+    };
 
     let edges_html: Vec<Html> = l
         .edges
@@ -377,11 +397,18 @@ pub fn graph(props: &GraphProps) -> Html {
         .filter_map(|(a, b)| {
             let na = l.nodes.get(a)?;
             let nb = l.nodes.get(b)?;
-            let class = if na.is_gateway || nb.is_gateway {
+            let mut classes_buf: Vec<&'static str> = Vec::with_capacity(2);
+            classes_buf.push(if na.is_gateway || nb.is_gateway {
                 "edge edge-gw-peer"
             } else {
                 "edge"
-            };
+            });
+            if let Some(fset) = focus {
+                if !(fset.contains(a) && fset.contains(b)) {
+                    classes_buf.push("edge-dimmed");
+                }
+            }
+            let class = classes_buf.join(" ");
             Some(html! {
                 <line class={class}
                       x1={na.x.to_string()} y1={na.y.to_string()}
@@ -391,6 +418,11 @@ pub fn graph(props: &GraphProps) -> Html {
         .collect();
 
     let selected_id = props.selected.clone();
+
+    // Use wall-clock at render time to score staleness. Recomputed per
+    // tick (cheap), so a publisher that goes silent fades smoothly as
+    // its timestamp ages instead of flipping at the next sync.
+    let now_ms = web_sys::js_sys::Date::now() as u64;
 
     let nodes_html: Vec<Html> = l
         .nodes
@@ -405,6 +437,23 @@ pub fn graph(props: &GraphProps) -> Html {
             } else {
                 ("node-floating", 5.5)
             };
+
+            // Stale fade: only applied when we have a timestamp at all
+            // (transitive peers stay normal-opacity — we have no signal
+            // on their freshness, dimming them would be misleading).
+            let is_stale = n
+                .last_seen_ms
+                .map(|ts| now_ms.saturating_sub(ts) > STALE_AFTER_MS)
+                .unwrap_or(false);
+            let is_focus_dimmed = match focus {
+                Some(fset) => !fset.contains(&n.id),
+                None => false,
+            };
+            let class = classes!(
+                class,
+                is_stale.then_some("node-stale"),
+                is_focus_dimmed.then_some("node-dimmed"),
+            );
 
             // Fill is the location hue. No-location nodes get a neutral grey.
             let fill_style = match n.location {
@@ -447,42 +496,16 @@ pub fn graph(props: &GraphProps) -> Html {
                 html! {}
             };
 
-            // Self-marker: a coloured ring (slightly inside the
-            // selection halo's radius so both can coexist when the
-            // user clicks their own node) plus a small "you" caption
-            // pinned above it. Drawn under the node circle so the
-            // node fill stays readable.
-            let (self_ring, self_tag) = if n.is_self {
-                let ring = html! {
-                    <circle class="node-self-ring"
-                            cx={n.x.to_string()} cy={n.y.to_string()}
-                            r={(r + 5.0).to_string()} />
-                };
-                let tag = html! {
-                    <text class="node-self-tag"
-                          x={n.x.to_string()}
-                          y={(n.y - r - 8.0).to_string()}
-                          text-anchor="middle">
-                        { "you" }
-                    </text>
-                };
-                (ring, tag)
-            } else {
-                (html! {}, html! {})
-            };
-
             html! {
                 <g key={n.id.clone()}>
                     { halo }
-                    { self_ring }
                     <circle class={class}
                             cx={n.x.to_string()} cy={n.y.to_string()}
                             r={r.to_string()}
                             style={fill_style}>
-                        <title>{ tooltip(n) }</title>
+                        <title>{ tooltip(n, now_ms) }</title>
                     </circle>
                     { label_node }
-                    { self_tag }
                 </g>
             }
         })
@@ -500,7 +523,7 @@ pub fn graph(props: &GraphProps) -> Html {
     }
 }
 
-fn tooltip(n: &PhysNode) -> String {
+fn tooltip(n: &PhysNode, now_ms: u64) -> String {
     let loc = n
         .location
         .map(|l| format!("{l:.4}"))
@@ -512,7 +535,26 @@ fn tooltip(n: &PhysNode) -> String {
     } else {
         "peer"
     };
-    format!("{}\n{kind} • location: {loc}", n.label)
+    let freshness = match n.last_seen_ms {
+        Some(ts) => format!(" • last seen {}", human_ago(now_ms.saturating_sub(ts))),
+        None => String::new(),
+    };
+    format!("{}\n{kind} • location: {loc}{freshness}", n.label)
+}
+
+/// Render a duration-ago in a compact human form. Stops at minutes —
+/// the tooltip is short, sub-second precision adds nothing.
+fn human_ago(ms_ago: u64) -> String {
+    let secs = ms_ago / 1000;
+    if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h{}m ago", secs / 3600, (secs % 3600) / 60)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
 }
 
 fn trim_label(s: &str) -> String {

@@ -18,7 +18,10 @@
 //! Concurrency is capped so we don't pin the local node's HTTP server
 //! when first encountering hundreds of contracts.
 
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use futures::stream::{self, StreamExt};
 use tokio::{
@@ -34,30 +37,100 @@ pub struct ProbeResult {
     pub title: Option<String>,
 }
 
+/// One cache entry: result plus the wall-clock time of the probe so we
+/// can re-probe stale entries.
+#[derive(Debug, Clone)]
+struct CacheEntry {
+    result: ProbeResult,
+    probed_at: Instant,
+}
+
 /// In-memory cache of probe results keyed by base58 contract key.
-pub type ProbeCache = HashMap<String, ProbeResult>;
+#[derive(Debug, Default)]
+pub struct ProbeCache {
+    inner: HashMap<String, CacheEntry>,
+}
+
+impl ProbeCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    pub fn webapp_count(&self) -> usize {
+        self.inner
+            .values()
+            .filter(|e| e.result.is_webapp == Some(true))
+            .count()
+    }
+
+    pub fn get(&self, key: &str) -> Option<ProbeResult> {
+        self.inner.get(key).map(|e| e.result.clone())
+    }
+}
 
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 const PROBE_CONCURRENCY: usize = 16;
 const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Cache entries older than this are eligible for re-probing once per
+/// cycle (so a webapp redeploy is picked up without a daemon restart).
+/// 30 minutes balances "freshness" against "don't hammer the local
+/// HTTP server" — at 620 contracts that's ~21 re-probes per cycle if
+/// every entry happens to be exactly past TTL.
+const PROBE_TTL: Duration = Duration::from_secs(30 * 60);
+/// Soft cap on stale re-probes per cycle — even if half the cache aged
+/// out at once, we don't want to issue hundreds of HTTP requests in a
+/// single tick. The oldest entries win the budget.
+const MAX_STALE_REPROBES_PER_CYCLE: usize = 64;
 
-/// Update `cache` with probe results for every key in `keys` not already
-/// cached. Probes run with bounded concurrency. Errors are *not* cached
-/// — a transient network blip won't poison a contract's classification
-/// for the rest of the daemon's lifetime; it'll be retried next cycle.
+/// Update `cache` with probe results. Two passes:
+///
+/// 1. **New keys** (not in cache) — always probed; the daemon sees a
+///    contract for the first time.
+/// 2. **Stale keys** (probed > [`PROBE_TTL`] ago, still present in
+///    `keys`) — re-probed up to [`MAX_STALE_REPROBES_PER_CYCLE`],
+///    oldest first. Lets a webapp redeploy/title-change reflect in
+///    the dashboard without a daemon restart.
+///
+/// Probes run with bounded concurrency. Transport errors do *not*
+/// poison the cache: a transient blip is not cached, and a stale
+/// entry whose re-probe failed retains the old data.
 pub async fn refresh_cache(host: &str, port: u16, keys: &[String], cache: &mut ProbeCache) {
-    let to_probe: Vec<String> = keys
-        .iter()
-        .filter(|k| !cache.contains_key(k.as_str()))
-        .cloned()
-        .collect();
+    let now = Instant::now();
+    let mut new_keys: Vec<String> = Vec::new();
+    // (key, age) for sorting stale keys by oldest first
+    let mut stale: Vec<(String, Duration)> = Vec::new();
+    for k in keys {
+        match cache.inner.get(k) {
+            None => new_keys.push(k.clone()),
+            Some(entry) => {
+                let age = now.saturating_duration_since(entry.probed_at);
+                if age >= PROBE_TTL {
+                    stale.push((k.clone(), age));
+                }
+            }
+        }
+    }
+    // Oldest first, capped — this turns the cache into an LRU-by-age
+    // for re-probes, so the budget is spent on the entries most
+    // likely to be stale in reality.
+    stale.sort_by(|a, b| b.1.cmp(&a.1));
+    stale.truncate(MAX_STALE_REPROBES_PER_CYCLE);
+
+    let mut to_probe: Vec<String> = Vec::with_capacity(new_keys.len() + stale.len());
+    to_probe.extend(new_keys.iter().cloned());
+    to_probe.extend(stale.iter().map(|(k, _)| k.clone()));
     if to_probe.is_empty() {
         return;
     }
     debug!(
-        new = to_probe.len(),
+        new = new_keys.len(),
+        stale = stale.len(),
         cached = cache.len(),
-        "probing local /v1/contract/web/<key>/ for new contracts"
+        "probing local /v1/contract/web/<key>/?__sandbox=1"
     );
 
     let host = host.to_string();
@@ -75,7 +148,13 @@ pub async fn refresh_cache(host: &str, port: u16, keys: &[String], cache: &mut P
 
     for (key, outcome) in results {
         if let Some(r) = outcome {
-            cache.insert(key, r);
+            cache.inner.insert(
+                key,
+                CacheEntry {
+                    result: r,
+                    probed_at: Instant::now(),
+                },
+            );
         }
     }
 }

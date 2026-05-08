@@ -33,3 +33,7 @@ url = "2"
 # the version the published `freenet-stdlib = "0.6.1"` uses so the
 # `WebApi::start(connection)` Connection type lines up.
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-webpki-roots", "url"] }
+# Tiny systemd-notify protocol implementation. Used for watchdog pings;
+# pure-Rust, no deps, opens `$NOTIFY_SOCKET` only when systemd set it
+# (no-op on systems without systemd, so dev builds stay portable).
+sd-notify = "0.4"

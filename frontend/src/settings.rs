@@ -64,31 +64,6 @@ pub struct ContractSettings {
     /// Base58-encoded `ContractInstanceId` of the deployed topology
     /// contract. Empty until the operator deploys it and pastes the value.
     pub instance_id: String,
-    /// Base58-encoded `CodeHash` of the same contract. Required only when
-    /// `publish_enabled` is true — `Subscribe` doesn't need it. Construct
-    /// `ContractKey` from instance + hash to address an `Update`.
-    #[serde(default)]
-    pub code_hash: String,
-    /// When true, the dashboard scrapes its local node's HTML dashboard
-    /// each `publish_interval_secs` and pushes a signed view of itself
-    /// into the contract — so this user becomes a publisher just by
-    /// keeping the dashboard tab open.
-    #[serde(default)]
-    pub publish_enabled: bool,
-    /// Cadence of self-publishing. Default 60 s, clamped to 5..3600.
-    #[serde(default = "default_publish_interval")]
-    pub publish_interval_secs: u32,
-    /// Hex-encoded Ed25519 secret seed. The publisher's stable
-    /// identity in the contract — never sent over the wire (only the
-    /// derived public key is). Generated automatically the first time
-    /// `publish_enabled` is turned on; persisted here so the same
-    /// browser keeps the same slot in the contract across reloads.
-    #[serde(default)]
-    pub identity_seed_hex: String,
-}
-
-fn default_publish_interval() -> u32 {
-    60
 }
 
 /// Default `node_ws_url` derived from the current page origin so the
@@ -115,33 +90,23 @@ fn default_node_ws_url() -> String {
 }
 
 /// Pre-filled topology contract published by the operator. New
-/// dashboards subscribe and publish to this contract by default so a
-/// freshly-loaded webapp "just works" without the user having to paste
-/// hashes from external instructions. If you redeploy the contract
-/// against new code or new initial state, update both constants.
+/// dashboards subscribe to this contract by default so a freshly-loaded
+/// webapp "just works" without the user having to paste hashes from
+/// external instructions. If you redeploy the contract against new
+/// code or new initial state, update this constant.
 const DEFAULT_TOPOLOGY_INSTANCE_ID: &str = "BRQiAyN4VSWRp6sW6Xvt2B6RmHyp6dQFFZhStvpnLUkE";
-const DEFAULT_TOPOLOGY_CODE_HASH: &str = "3Ug134jfYzEMkwJeRbTEgY33kgXHKEWnZLvmWi3eoDXV";
 
 impl Default for ContractSettings {
     fn default() -> Self {
-        // `enabled` and `publish_enabled` default to `true` so a freshly
-        // loaded webapp immediately joins the network: subscribes to the
-        // shared topology contract and starts publishing its own entry
-        // (signed with an auto-generated identity seed). The sandbox
-        // iframe loses `localStorage` on hard reload (opaque "null"
-        // origin → ephemeral storage), so users would otherwise have
-        // to re-tick both toggles every time. Privacy-wise the
-        // published payload is just (pubkey, known_nodes neighbours,
-        // timestamp) — nothing the user didn't already enter into
-        // settings or that isn't already on the public network.
+        // `enabled` defaults to `true` so a freshly loaded webapp
+        // immediately joins the network. The sandbox iframe loses
+        // `localStorage` on hard reload (opaque "null" origin →
+        // ephemeral storage), so users would otherwise have to re-tick
+        // every time.
         Self {
             enabled: true,
             node_ws_url: default_node_ws_url(),
             instance_id: DEFAULT_TOPOLOGY_INSTANCE_ID.to_string(),
-            code_hash: DEFAULT_TOPOLOGY_CODE_HASH.to_string(),
-            publish_enabled: true,
-            publish_interval_secs: default_publish_interval(),
-            identity_seed_hex: String::new(),
         }
     }
 }
@@ -289,36 +254,8 @@ impl Settings {
         self.layout.max_speed = self.layout.max_speed.clamp(2.0, 80.0);
         self.layout.repel_min_dist = self.layout.repel_min_dist.clamp(2.0, 60.0);
         self.layout.soft_clamp_radius = self.layout.soft_clamp_radius.clamp(200.0, 600.0);
-        self.contract.publish_interval_secs = self.contract.publish_interval_secs.clamp(5, 3600);
         self
     }
-}
-
-/// Generate a fresh Ed25519 secret seed (32 bytes → 64 hex chars) using
-/// the browser's CSPRNG (`crypto.getRandomValues`).
-pub fn generate_identity_seed_hex() -> String {
-    let mut seed = [0u8; 32];
-    // Should never fail in a browser — `getrandom` with `js` feature
-    // routes to `crypto.getRandomValues`. If it does fail, fall back to
-    // an all-zero seed (will be obviously broken in the UI; better than
-    // panicking the WASM bundle).
-    if getrandom::getrandom(&mut seed).is_err() {
-        return "00".repeat(32);
-    }
-    hex::encode(seed)
-}
-
-/// Derive the Ed25519 public key from a hex-encoded secret seed.
-/// Returns None if the input isn't 32 bytes of hex.
-pub fn derive_pubkey_hex(seed_hex: &str) -> Option<String> {
-    let bytes = hex::decode(seed_hex.trim()).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
-    let sk = ed25519_dalek::SigningKey::from_bytes(&seed);
-    Some(hex::encode(sk.verifying_key().to_bytes()))
 }
 
 /// Try to load settings from `localStorage`, falling back to URL fragment.
@@ -327,30 +264,23 @@ pub fn derive_pubkey_hex(seed_hex: &str) -> Option<String> {
 /// URL fragment persistence note: a sandboxed iframe runs at an opaque
 /// "null" origin, and Chrome treats `localStorage` for opaque origins
 /// as ephemeral — it gets wiped on reload. The URL fragment (`#…`)
-/// survives reloads, so we mirror at least the identity seed there.
-/// On load we prefer `localStorage` (full settings), falling back to
-/// the fragment (identity-only — keeps the same publisher slot).
+/// survives reloads, so we mirror cross-reload-relevant settings there
+/// (currently `known_nodes` + `sidebar_width`).
 pub fn load_from_storage() -> Option<Settings> {
     let storage = web_sys::window().and_then(|w| w.local_storage().ok().flatten());
     if let Some(storage) = storage.as_ref() {
         if let Ok(Some(raw)) = storage.get_item(STORAGE_KEY) {
             if let Ok(parsed) = serde_json::from_str::<Settings>(&raw) {
-                return Some(parsed.normalize().with_seed_from_fragment_if_empty());
+                return Some(parsed.normalize().with_persistent_from_fragment());
             }
         }
     }
-    // localStorage absent / unparseable — start from defaults but pull
-    // the seed out of the URL fragment if it's there. That way a hard
-    // reload of the sandbox iframe keeps the same publisher pubkey.
-    Some(Settings::default().with_seed_from_fragment_if_empty())
+    Some(Settings::default().with_persistent_from_fragment())
 }
 
-/// Persist settings to `localStorage` AND mirror the identity seed to
-/// the URL fragment so the publisher slot survives sandbox-iframe
-/// `localStorage` resets. Other settings are not put in the fragment
-/// because they would be visible in the address bar; the seed is the
-/// only thing that needs cross-reload persistence (every other field
-/// has a sensible default and is easy to re-enter).
+/// Persist settings to `localStorage` AND mirror cross-reload-relevant
+/// fields to the URL fragment so a sandbox-iframe hard reload doesn't
+/// reset them. Currently mirrored: `known_nodes` + `sidebar_width`.
 pub fn save_to_storage(s: &Settings) {
     let Some(window) = web_sys::window() else {
         return;
@@ -365,11 +295,7 @@ pub fn save_to_storage(s: &Settings) {
             Err(e) => log::warn!("settings serialise failed: {e}"),
         }
     }
-    write_persistent_to_fragment(
-        &s.contract.identity_seed_hex,
-        &s.known_nodes,
-        s.sidebar_width,
-    );
+    write_persistent_to_fragment(&s.known_nodes, s.sidebar_width);
 }
 
 /// Read fields previously written by `write_persistent_to_fragment`.
@@ -383,12 +309,7 @@ fn read_fragment() -> Fragment {
     };
     let trimmed = hash.trim_start_matches('#');
     for part in trimmed.split('&') {
-        if let Some(rest) = part.strip_prefix("seed=") {
-            let candidate = rest.trim();
-            if candidate.len() == 64 && candidate.chars().all(|c| c.is_ascii_hexdigit()) {
-                out.seed = Some(candidate.to_string());
-            }
-        } else if let Some(rest) = part.strip_prefix("nodes=") {
+        if let Some(rest) = part.strip_prefix("nodes=") {
             // base64-url-encoded JSON array of [label, address, loc, gw].
             // Tuple form is shorter than full struct names — keeps the
             // fragment under the 8 KiB shell cap even with many entries.
@@ -418,7 +339,6 @@ fn read_fragment() -> Fragment {
 
 #[derive(Default)]
 struct Fragment {
-    seed: Option<String>,
     nodes: Option<Vec<KnownNode>>,
     sidebar_width: Option<i32>,
 }
@@ -438,7 +358,8 @@ fn url_b64_decode(s: &str) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// Mirror the identity seed AND known-nodes list into the URL fragment.
+/// Mirror the known-nodes list and sidebar width into the URL
+/// fragment.
 ///
 /// We're inside the sandboxed iframe whose location is
 /// `…?__sandbox=1`. Updating *iframe* `location.hash` would survive
@@ -452,20 +373,11 @@ fn url_b64_decode(s: &str) -> Option<Vec<u8>> {
 /// reload, the outer shell forwards the hash back to the freshly-
 /// loaded iframe (line 951 `forwardHash`), iframe shim writes it
 /// onto our `location.hash`, and `read_fragment` picks it up.
-///
-/// Privacy note: anyone the user shares this URL with also gets the
-/// seed (= ability to publish under the same pubkey) and the
-/// known_nodes list. The seed is anonymous (no real-world identity)
-/// and known_nodes are intentionally-public addresses, so the
-/// trade-off is acceptable for restoring state across hard reloads.
-fn write_persistent_to_fragment(seed: &str, nodes: &[KnownNode], sidebar_width: i32) {
+fn write_persistent_to_fragment(nodes: &[KnownNode], sidebar_width: i32) {
     let Some(window) = web_sys::window() else {
         return;
     };
     let mut parts: Vec<String> = Vec::new();
-    if !seed.is_empty() {
-        parts.push(format!("seed={}", seed));
-    }
     let tuples: Vec<NodeTuple> = nodes
         .iter()
         .map(|n| {
@@ -529,17 +441,12 @@ fn write_persistent_to_fragment(seed: &str, nodes: &[KnownNode], sidebar_width: 
 }
 
 impl Settings {
-    /// Hydrate seed and (if absent) known_nodes from the URL fragment.
+    /// Hydrate `known_nodes` and `sidebar_width` from the URL fragment.
     /// Called both when localStorage parses cleanly and when we fall
     /// back to defaults — sandbox `localStorage` is wiped on reload,
     /// so the fragment is what makes a fresh load look "remembered".
-    fn with_seed_from_fragment_if_empty(mut self) -> Self {
+    fn with_persistent_from_fragment(mut self) -> Self {
         let frag = read_fragment();
-        if self.contract.identity_seed_hex.is_empty() {
-            if let Some(seed) = frag.seed {
-                self.contract.identity_seed_hex = seed;
-            }
-        }
         // Fragment-restored nodes win over hardcoded defaults: if the
         // user's last session had a custom list, that list comes back.
         // The fragment is only set after `save_to_storage`, which only

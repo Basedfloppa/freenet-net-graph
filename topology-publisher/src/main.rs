@@ -48,8 +48,11 @@ use tokio_tungstenite::connect_async;
 use tracing::{debug, info, warn};
 use url::Url;
 
+mod health;
 mod probe;
+use health::HealthSnapshot;
 use probe::ProbeCache;
+use tokio::sync::watch;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -100,6 +103,14 @@ struct Cli {
     /// Network-mode nodes ignore this — they get the real peer list.
     #[arg(long = "neighbor", value_name = "LABEL,HOST:PORT")]
     neighbors: Vec<String>,
+
+    /// Bind a tiny HTTP `/healthz` endpoint on `127.0.0.1:<port>`. A
+    /// monitoring scraper or `curl` on the same host can read the
+    /// daemon's last-known state as JSON. `0` (default) disables.
+    /// Only `127.0.0.1` is bound — health data isn't sensitive but
+    /// there's no reason to expose it across the LAN either.
+    #[arg(long, default_value_t = 0u16)]
+    metrics_port: u16,
 }
 
 fn parse_neighbor_arg(s: &str) -> NeighborInfo {
@@ -280,7 +291,7 @@ fn build_payload(
     let contracts: Vec<String> = keys
         .into_iter()
         .map(|k| {
-            let r = probe_cache.get(&k).cloned().unwrap_or_default();
+            let r = probe_cache.get(&k).unwrap_or_default();
             encode_contract_entry(&k, r.is_webapp, r.title.as_deref())
         })
         .collect();
@@ -296,6 +307,14 @@ fn build_payload(
     }
 }
 
+/// What `publish_one_cycle` reports back on a successful publish so the
+/// caller can update the health snapshot without re-reading state.
+#[derive(Debug, Clone, Copy, Default)]
+struct PublishOutcome {
+    peer_count: usize,
+    contract_count: usize,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn publish_one_cycle(
     api: &mut WebApi,
@@ -308,7 +327,7 @@ async fn publish_one_cycle(
     http_host: &str,
     http_port: u16,
     probe_cache: &mut ProbeCache,
-) -> Result<()> {
+) -> Result<PublishOutcome> {
     let payload = if *diagnostics_supported {
         api.send(ClientRequest::NodeQueries(NodeQuery::NodeDiagnostics {
             config: NodeDiagnosticsConfig::full(),
@@ -422,18 +441,17 @@ async fn publish_one_cycle(
     .await
     .map_err(|e| anyhow!("send Update: {e:?}"))?;
 
-    let webapp_count = probe_cache
-        .values()
-        .filter(|r| r.is_webapp == Some(true))
-        .count();
     info!(
         peers = payload.neighbors.len(),
         contracts = payload.contracts.len(),
-        webapps = webapp_count,
+        webapps = probe_cache.webapp_count(),
         probed = probe_cache.len(),
         "published topology entry"
     );
-    Ok(())
+    Ok(PublishOutcome {
+        peer_count: payload.neighbors.len(),
+        contract_count: payload.contracts.len(),
+    })
 }
 
 #[tokio::main]
@@ -468,6 +486,95 @@ async fn main() -> Result<()> {
     let http_host = url.host_str().unwrap_or("127.0.0.1").to_string();
     let http_port = url.port().unwrap_or(7509);
     info!(%url, http_host = %http_host, http_port, "connecting to local freenet node");
+
+    let fallback_neighbors: Vec<NeighborInfo> =
+        cli.neighbors.iter().map(|s| parse_neighbor_arg(s)).collect();
+    // State that should survive WS reconnects:
+    //   - `probe_cache`: rebuilding it requires re-probing hundreds of
+    //     contracts; keeping it across reconnects avoids a thundering
+    //     herd on the local HTTP server every time the WS blips.
+    //   - `diagnostics_supported`: a node that rejected NodeQueries
+    //     during the previous session is still going to reject them
+    //     after a reconnect — same WS shape, same gating.
+    let mut probe_cache: ProbeCache = ProbeCache::new();
+    let mut diagnostics_supported = true;
+
+    // `watch` channel: publish loop is the single writer, every health
+    // server connection is a reader. last-write-wins matches the
+    // semantic we want (always serve the freshest snapshot).
+    let (health_tx, health_rx) = watch::channel(HealthSnapshot::default());
+    if cli.metrics_port > 0 {
+        let port = cli.metrics_port;
+        let rx = health_rx.clone();
+        tokio::spawn(async move {
+            if let Err(e) = health::run_health_server(port, rx).await {
+                warn!(error = %e, "health server exited; /healthz will not be available");
+            }
+        });
+        info!(port = cli.metrics_port, "health endpoint /healthz active");
+    }
+
+    // Reconnect with exponential backoff. The outer freenet node could
+    // be restarting, the WS could drop after a network blip, etc. —
+    // without this loop the systemd unit would respawn and lose the
+    // probe cache on every blip. Backoff is bounded so a sustained
+    // outage doesn't burn CPU or spam the journal.
+    let backoff_min = Duration::from_secs(1);
+    let backoff_max = Duration::from_secs(60);
+    let mut backoff = backoff_min;
+    loop {
+        match run_session(
+            &url,
+            &sk,
+            instance,
+            code_hash,
+            cli.label.as_deref(),
+            &fallback_neighbors,
+            &mut diagnostics_supported,
+            &http_host,
+            http_port,
+            &mut probe_cache,
+            cli.interval_secs.max(5),
+            &health_tx,
+        )
+        .await
+        {
+            Ok(()) => {
+                // Sessions don't return Ok normally — the publish loop
+                // is infinite. If we got here, treat as a clean exit
+                // and try again with min-backoff.
+                backoff = backoff_min;
+            }
+            Err(e) => {
+                warn!(error = %e, backoff_secs = backoff.as_secs(), "session ended; reconnecting");
+            }
+        }
+        // Reflect "session is down" in the health snapshot so a
+        // scraper notices the gap immediately rather than after the
+        // next successful publish.
+        let mut snap = health_tx.borrow().clone();
+        snap.session_alive = false;
+        let _ = health_tx.send(snap);
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(backoff_max);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_session(
+    url: &Url,
+    sk: &SigningKey,
+    instance: ContractInstanceId,
+    code_hash: CodeHash,
+    label: Option<&str>,
+    fallback_neighbors: &[NeighborInfo],
+    diagnostics_supported: &mut bool,
+    http_host: &str,
+    http_port: u16,
+    probe_cache: &mut ProbeCache,
+    interval_secs: u64,
+    health_tx: &watch::Sender<HealthSnapshot>,
+) -> Result<()> {
     let (stream, _resp) = connect_async(url.as_str()).await.context("ws connect")?;
     let mut api = WebApi::start(stream);
 
@@ -482,33 +589,71 @@ async fn main() -> Result<()> {
     .map_err(|e| anyhow!("send Subscribe: {e:?}"))?;
     info!("subscribed to topology contract");
 
-    let mut tick = interval(Duration::from_secs(cli.interval_secs.max(5)));
+    // Tell systemd we're done starting — without this `READY=1` the
+    // unit (`Type=notify`) stays in "starting" state and watchdog
+    // stays disarmed. Idempotent on reconnects: harmless to call
+    // again, systemd just sees a no-op.
+    health::notify_ready();
+
+    // Mark session as live in the health snapshot the moment we
+    // subscribe — a scraper polling /healthz right after a reconnect
+    // shouldn't see `session_alive: false` until we drop again.
+    {
+        let mut snap = health_tx.borrow().clone();
+        snap.session_alive = true;
+        let _ = health_tx.send(snap);
+    }
+
+    let mut tick = interval(Duration::from_secs(interval_secs));
     tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-    let fallback_neighbors: Vec<NeighborInfo> =
-        cli.neighbors.iter().map(|s| parse_neighbor_arg(s)).collect();
-    let mut diagnostics_supported = true;
-    // Cache probe results across cycles so we hit the local HTTP API
-    // only for newly-seen contracts. Lifetime = process lifetime.
-    let mut probe_cache: ProbeCache = ProbeCache::new();
 
     loop {
         tick.tick().await;
         match publish_one_cycle(
             &mut api,
-            &sk,
+            sk,
             instance,
             code_hash,
-            cli.label.as_deref(),
-            &fallback_neighbors,
-            &mut diagnostics_supported,
-            &http_host,
+            label,
+            fallback_neighbors,
+            diagnostics_supported,
+            http_host,
             http_port,
-            &mut probe_cache,
+            probe_cache,
         )
         .await
         {
-            Ok(()) => {}
-            Err(e) => warn!(error = %e, "publish cycle failed; will retry next tick"),
+            Ok(outcome) => {
+                // Refresh the snapshot served at /healthz and ping the
+                // systemd watchdog (if `WatchdogSec=` is configured)
+                // so the unit isn't killed for inactivity.
+                let snap = HealthSnapshot {
+                    last_publish_unix: HealthSnapshot::now_secs(),
+                    last_publish_secs_ago: 0,
+                    session_alive: true,
+                    last_peer_count: outcome.peer_count,
+                    last_contract_count: outcome.contract_count,
+                    last_webapp_count: probe_cache.webapp_count(),
+                    probed_total: probe_cache.len(),
+                };
+                let _ = health_tx.send(snap);
+                health::ping_watchdog();
+            }
+            // A `send Update`/`send NodeQueries` failure almost always
+            // means the WS is dead — bubble up to trigger reconnect.
+            // The matchable text comes from the `anyhow!` strings in
+            // `publish_one_cycle`.
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("send Update")
+                    || msg.contains("send NodeDiagnostics")
+                    || msg.contains("send Subscribe")
+                    || msg.contains("recv:")
+                {
+                    return Err(e.context("WS session error; reconnecting"));
+                }
+                warn!(error = %e, "publish cycle failed; will retry next tick");
+            }
         }
         // Drain any UpdateNotifications that arrived during the cycle
         // so the channel doesn't back up. Non-blocking peek-style: try
@@ -525,8 +670,9 @@ async fn main() -> Result<()> {
                     _ => debug!(?resp, "other response"),
                 },
                 Ok(Err(e)) => {
-                    warn!(error = %e, "recv error during drain");
-                    break;
+                    // Hard recv error → WS is dead, return so the outer
+                    // loop can reconnect.
+                    return Err(anyhow!("recv error during drain: {e:?}"));
                 }
                 Err(_) => break, // timeout — channel idle
             }

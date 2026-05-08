@@ -90,6 +90,13 @@ pub struct GatewayView {
     /// on older freenet builds; serde defaults the field to empty.
     #[serde(default)]
     pub contracts: Vec<ContractView>,
+    /// Wall-clock ms when the publisher entry behind this gateway view
+    /// was signed — i.e. how fresh its peer/contract data is. The
+    /// frontend uses this to fade gateways that haven't reposted in a
+    /// while ("stale publisher" UX). Older state shapes that don't
+    /// carry this field deserialise to `None` and render as fresh.
+    #[serde(default)]
+    pub last_seen_ms: Option<u64>,
 }
 
 /// One row from a gateway's "Subscribed Contracts" table.

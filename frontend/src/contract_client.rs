@@ -26,15 +26,13 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::str::FromStr;
 
-use ed25519_dalek::{Signer, SigningKey};
+use crate::ws_shim::WsShim;
 use freenet_stdlib::client_api::{
     ClientError, ClientRequest, ContractRequest, ContractResponse, Error as WebApiError,
-    HostResponse, WebApi,
+    HostResponse,
 };
-use freenet_stdlib::prelude::{
-    CodeHash, ContractInstanceId, ContractKey, StateDelta, UpdateData,
-};
-use shared::contract::{ContractDelta, EntryPayload, SignedEntry};
+use freenet_stdlib::prelude::{ContractInstanceId, UpdateData};
+use shared::contract::{EntryPayload, SignedEntry};
 use yew::Callback;
 
 use crate::settings::ContractSettings;
@@ -69,12 +67,16 @@ pub struct RemoteEntry {
 }
 
 /// Owned handle to a live subscription. Drop it to close the WebSocket
-/// (`WebApi::Drop` sends a `1000 Normal Closure` frame).
+/// (`WsShim::Drop` sends a `1000 Normal Closure` frame via
+/// `WebSocket::close`).
 pub struct ContractClient {
-    /// Shared so the `onopen` callback inside `WebApi::start` can reach
-    /// back in to send the initial Subscribe, and the App's publisher
-    /// worker can later send Updates over the same connection.
-    api: Rc<RefCell<Option<WebApi>>>,
+    /// Owns the `WsShim`; `Drop` closes the WebSocket when the client
+    /// goes out of scope (the `Rc<RefCell<Option<…>>>` shape exists so
+    /// the `onopen` callback inside `WsShim::start` can reach back in
+    /// to send the initial Subscribe). Marked unused-but-load-bearing:
+    /// dropping this field is the only way the subscription terminates.
+    #[allow(dead_code)]
+    api: Rc<RefCell<Option<WsShim>>>,
 }
 
 impl ContractClient {
@@ -101,7 +103,7 @@ impl ContractClient {
         let socket = web_sys::WebSocket::new(&url)
             .map_err(|e| format!("WebSocket::new failed: {e:?}"))?;
 
-        let api: Rc<RefCell<Option<WebApi>>> = Rc::new(RefCell::new(None));
+        let api: Rc<RefCell<Option<WsShim>>> = Rc::new(RefCell::new(None));
 
         let result_handler = {
             let on_entry = on_entry.clone();
@@ -124,7 +126,7 @@ impl ContractClient {
             move || {
                 // Once the socket is open, fire off the `Subscribe`
                 // request. We do it inside `spawn_local` because
-                // `WebApi::send` is async and we're inside a sync
+                // `WsShim::send` is async and we're inside a sync
                 // browser callback. Errors at this stage become
                 // `Error(...)` status updates.
                 let api = api.clone();
@@ -133,7 +135,7 @@ impl ContractClient {
                     let mut guard = api.borrow_mut();
                     let Some(api) = guard.as_mut() else {
                         on_status.emit(ContractStatus::Error(
-                            "WebApi was dropped before onopen fired".into(),
+                            "WsShim was dropped before onopen fired".into(),
                         ));
                         return;
                     };
@@ -173,81 +175,12 @@ impl ContractClient {
             }
         };
 
-        let started = WebApi::start(socket, result_handler, error_handler, onopen_handler);
+        let started = WsShim::start(socket, result_handler, error_handler, onopen_handler);
         *api.borrow_mut() = Some(started);
 
         Ok(Self { api })
     }
 
-    /// Sign and publish one local view as an `Update` to the topology
-    /// contract. Used by the App's periodic publisher so this dashboard
-    /// tab contributes its own neighbour-list to the network.
-    ///
-    /// Errors are returned as strings rather than typed enums because the
-    /// underlying `WebApi` send error itself bubbles up as `Debug` text.
-    pub async fn publish(
-        &self,
-        payload: &EntryPayload,
-        sk: &SigningKey,
-        instance_id: ContractInstanceId,
-        code_hash: CodeHash,
-    ) -> Result<(), String> {
-        let payload_bytes =
-            bincode::serialize(payload).map_err(|e| format!("serialize payload: {e}"))?;
-        let sig = sk.sign(&payload_bytes);
-        let signed = SignedEntry {
-            payload: payload_bytes,
-            signature: sig.to_bytes(),
-        };
-        // Sanity check: verify the signature locally before shipping it,
-        // and confirm that bincode round-trips ContractDelta cleanly.
-        // Without these, an in-WASM mismatch silently rejects every
-        // update on the contract side and the empty contract looks like
-        // a network bug.
-        match signed.verify() {
-            Ok(_) => web_sys::console::log_1(
-                &format!(
-                    "[net-graph publish] local signature OK (payload_len={} sig_len={})",
-                    signed.payload.len(),
-                    signed.signature.len()
-                )
-                .into(),
-            ),
-            Err(e) => web_sys::console::log_1(
-                &format!("[net-graph publish] local signature FAILED: {e:?}").into(),
-            ),
-        }
-        let delta = ContractDelta {
-            entries: vec![signed],
-        };
-        let delta_bytes =
-            bincode::serialize(&delta).map_err(|e| format!("serialize delta: {e}"))?;
-        match bincode::deserialize::<ContractDelta>(&delta_bytes) {
-            Ok(roundtripped) => web_sys::console::log_1(
-                &format!(
-                    "[net-graph publish] delta round-trip OK ({} entries, {} bytes)",
-                    roundtripped.entries.len(),
-                    delta_bytes.len()
-                )
-                .into(),
-            ),
-            Err(e) => web_sys::console::log_1(
-                &format!("[net-graph publish] delta round-trip FAILED: {e}").into(),
-            ),
-        }
-
-        let key = ContractKey::from_id_and_code(instance_id, code_hash);
-        let req = ClientRequest::ContractOp(ContractRequest::Update {
-            key,
-            data: UpdateData::Delta(StateDelta::from(delta_bytes)),
-        });
-
-        let mut guard = self.api.borrow_mut();
-        let api = guard
-            .as_mut()
-            .ok_or_else(|| "ContractClient was dropped".to_string())?;
-        api.send(req).await.map_err(|e| format!("{e:?}"))
-    }
 }
 
 fn handle_host_response(

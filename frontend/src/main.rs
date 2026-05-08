@@ -1,12 +1,9 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
-use std::str::FromStr;
 
-use ed25519_dalek::SigningKey;
-use freenet_stdlib::prelude::{CodeHash, ContractInstanceId};
-use gloo_timers::callback::{Interval, Timeout};
-use shared::contract::{decode_contract_entry, EntryPayload, NeighborInfo};
+use gloo_timers::callback::Timeout;
+use shared::contract::decode_contract_entry;
 use shared::{ContractMeta, ContractView, FetchStatus, GatewayView, KnownNode, PeerView, Topology};
 use wasm_bindgen_futures::JsFuture;
 use yew::prelude::*;
@@ -14,6 +11,7 @@ use yew::prelude::*;
 mod contract_client;
 mod graph;
 mod settings;
+mod ws_shim;
 
 use contract_client::{ContractClient, ContractStatus, RemoteEntry};
 use settings::{LayoutSettings, PersistedFilter, Settings};
@@ -124,155 +122,19 @@ fn app() -> Html {
         });
     }
 
-    // ---- identity bootstrap: generate a seed the first time the user
-    //      enables publishing. We do this in an effect (rather than at
-    //      the toggle-change site) so the same logic also triggers on a
-    //      fresh load when localStorage carries `publish_enabled = true`
-    //      but no seed somehow.
-    {
-        let settings = settings.clone();
-        let dep = (
-            settings.contract.publish_enabled,
-            settings.contract.identity_seed_hex.is_empty(),
-        );
-        use_effect_with(dep, move |&(enabled, missing)| {
-            if enabled && missing {
-                let mut next = (*settings).clone();
-                next.contract.identity_seed_hex = settings::generate_identity_seed_hex();
-                settings::save_to_storage(&next);
-                settings.set(next);
-            }
-            || ()
-        });
-    }
-
-    // ---- periodic publisher worker -----------------------------------
-    // Runs only when:
-    //   * `publish_enabled = true`
-    //   * we have a usable identity seed
-    //   * `instance_id` and `code_hash` are both filled in
-    //   * a ContractClient is actually open (so we can send Update)
-    // Fetches the local node's `/` dashboard each interval, parses peers
-    // + contracts via the same scraper module the legacy backend used,
-    // builds an EntryPayload, signs with the user's seed, and pushes
-    // through the existing WS via `ContractClient::publish`.
-    {
-        let holder = contract_client_holder.clone();
-        let settings_dep = (settings.contract.clone(), settings.known_nodes.clone());
-        let contract_status = contract_status.clone();
-        use_effect_with(settings_dep, move |dep| {
-            let cfg = dep.0.clone();
-            let known_nodes = dep.1.clone();
-            // Cleanup: a `None` Interval aborts the effect with no-op.
-            if !cfg.publish_enabled
-                || cfg.identity_seed_hex.is_empty()
-                || cfg.instance_id.trim().is_empty()
-                || cfg.code_hash.trim().is_empty()
-            {
-                return Box::new(|| ()) as Box<dyn FnOnce()>;
-            }
-
-            let instance_id = match ContractInstanceId::from_str(cfg.instance_id.trim()) {
-                Ok(id) => id,
-                Err(e) => {
-                    contract_status.set(ContractStatus::Error(format!(
-                        "publish: bad instance_id: {e}"
-                    )));
-                    return Box::new(|| ()) as Box<dyn FnOnce()>;
-                }
-            };
-            let code_hash = match decode_code_hash(&cfg.code_hash) {
-                Ok(h) => h,
-                Err(e) => {
-                    contract_status.set(ContractStatus::Error(format!(
-                        "publish: bad code_hash: {e}"
-                    )));
-                    return Box::new(|| ()) as Box<dyn FnOnce()>;
-                }
-            };
-            let signing_key = match decode_signing_key(&cfg.identity_seed_hex) {
-                Some(sk) => sk,
-                None => {
-                    contract_status.set(ContractStatus::Error(
-                        "publish: identity seed is malformed".into(),
-                    ));
-                    return Box::new(|| ()) as Box<dyn FnOnce()>;
-                }
-            };
-
-            let interval_ms = cfg.publish_interval_secs.saturating_mul(1000);
-            let interval = {
-                let holder = holder.clone();
-                let contract_status = contract_status.clone();
-                let signing_key = signing_key.clone();
-                let known_nodes = known_nodes.clone();
-                Interval::new(interval_ms, move || {
-                    let holder = holder.clone();
-                    let signing_key = signing_key.clone();
-                    let contract_status = contract_status.clone();
-                    let known_nodes = known_nodes.clone();
-                    wasm_bindgen_futures::spawn_local(async move {
-                        if let Err(reason) = publish_one_cycle(
-                            &holder,
-                            &signing_key,
-                            instance_id,
-                            code_hash,
-                            known_nodes,
-                        )
-                        .await
-                        {
-                            contract_status
-                                .set(ContractStatus::Error(format!("publish: {reason}")));
-                        }
-                    });
-                })
-            };
-
-            // Fire one immediate publish so the user gets feedback right
-            // after toggling, without waiting a full interval.
-            {
-                let holder = holder.clone();
-                let signing_key = signing_key.clone();
-                let contract_status = contract_status.clone();
-                let known_nodes = known_nodes.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    if let Err(reason) = publish_one_cycle(
-                        &holder,
-                        &signing_key,
-                        instance_id,
-                        code_hash,
-                        known_nodes,
-                    )
-                    .await
-                    {
-                        contract_status.set(ContractStatus::Error(format!("publish: {reason}")));
-                    }
-                });
-            }
-
-            Box::new(move || drop(interval)) as Box<dyn FnOnce()>
-        });
-    }
-
     // ---- topology built fresh from the subscription each render -----
     // No polling. The graph reflects whatever entries we've verified
     // through the contract so far, plus the user's `known_nodes` list.
-    // We also derive the local publisher's pubkey hex from the seed so
-    // the graph can highlight the user's own node — but only when the
-    // user is actually publishing, otherwise highlighting any random
-    // pubkey-match would be misleading.
-    let self_pubkey_hex: Option<String> = if settings.contract.publish_enabled {
-        settings::derive_pubkey_hex(&settings.contract.identity_seed_hex)
-    } else {
-        None
-    };
-    let (built_topo, self_node_id) = build_topology(
-        &remote_entries,
-        &settings.known_nodes,
-        self_pubkey_hex.as_deref(),
-    );
-    let topo = Rc::new(built_topo);
-    let self_node_id_rc: Rc<Option<String>> = Rc::new(self_node_id);
+    // The dashboard is read-only — only the operator-side daemons
+    // ([topology-publisher]) write into the contract; visitors here
+    // never sign or publish anything.
+    let topo = Rc::new(build_topology(&remote_entries, &settings.known_nodes));
+    // Selection-driven highlight set: which graph node ids should stay
+    // at full opacity. None = no selection / no match → default render.
+    let highlight_set: Rc<Option<HashSet<String>>> = Rc::new(compute_highlight_set(
+        &topo,
+        selected.as_deref(),
+    ));
     // Error banner now shows the contract-subscription failure state
     // (config error, WS closed, decode failure) — there's no second
     // "fetch" channel any more.
@@ -428,39 +290,28 @@ fn app() -> Html {
                     <graph::Graph
                         topology={topo.clone()}
                         selected={(*selected).clone()}
-                        self_node_id={(*self_node_id_rc).clone()}
+                        highlight_set={highlight_set.clone()}
                         layout={layout}
                     />
                     {
                         if publisher_count == 0 {
                             // No verified entries from the contract yet —
-                            // either the user hasn't subscribed/published, or
-                            // they're the first dashboard on this contract.
-                            // Either way, the graph only shows static
-                            // known_nodes; nudge them at the settings.
-                            let toggle_drawer_inline = toggle_drawer.clone();
+                            // the dashboard is read-only; show a hint
+                            // pointing at the daemon side, which is the
+                            // only thing that fills the graph.
                             html! {
                                 <div class="empty-hint">
-                                    <h3>{"Graph is sparse — here's how to fill it"}</h3>
-                                    <ol>
-                                        <li>{"Open ⚙ → "}<b>{"🔗 Network sharing"}</b>
-                                            {" and turn on "}<b>{"enabled"}</b>{" + "}
-                                            <b>{"publish enabled"}</b>{". You start \
-                                            publishing your own entry."}</li>
-                                        <li>{"Open ⚙ → "}<b>{"🌐 Data sources → \
-                                            Known public nodes"}</b>{" and add the \
-                                            peers you want others to see in your \
-                                            entry's "}<code>{"neighbors"}</code>{" list."}</li>
-                                        <li>{"Get other operators to open this same \
-                                            URL on their own freenet nodes and turn \
-                                            "}<b>{"publish enabled"}</b>{" on too. \
-                                            Each one adds a publisher to the graph."}</li>
-                                    </ol>
-                                    <p>{"The dashboard runs in a sandbox iframe and \
-                                    cannot auto-discover its host node's peers \
-                                    (CORS + freenet-core's webapp NodeQueries gate). \
-                                    Manual + crowdsourced is the design."}</p>
-                                    <button onclick={toggle_drawer_inline}>{"Open settings"}</button>
+                                    <h3>{"Graph is empty — no daemons publishing"}</h3>
+                                    <p>{"This dashboard subscribes to the topology contract \
+                                    but doesn't publish anything itself (sandbox + \
+                                    NodeQueries gates make it impossible). Operators \
+                                    contribute by running the "}
+                                    <a href="https://github.com/Basedfloppa/freenet-net-graph"
+                                       target="_blank" rel="noopener noreferrer">
+                                       <code>{"topology-publisher"}</code></a>
+                                    {" daemon alongside their freenet node — see the \
+                                    repo's "}<code>{"topology-publisher/README.md"}</code>
+                                    {" for a one-page setup guide."}</p>
                                 </div>
                             }
                         } else { html! {} }
@@ -472,7 +323,6 @@ fn app() -> Html {
                     <span><span class="swatch" style="background: var(--gateway)"></span>{"gateway"}</span>
                     <span><span class="swatch hue-key"></span>{"node fill = location hue"}</span>
                     <span><span class="swatch" style="background: #6b7280"></span>{"location unknown"}</span>
-                    <span><span class="swatch self-key"></span>{"you"}</span>
                 </div>
                 <span>{ "Live subscription — push, not poll" }</span>
                 <a
@@ -526,25 +376,17 @@ fn app() -> Html {
 /// hints the daemon publishes — it probes `/v1/contract/web/<key>/` on
 /// its local node (something the sandboxed dashboard iframe can't do
 /// because of CORS) and encodes the result inside each contract entry
-/// via `shared::contract::encode_contract_entry`. Browser-side skeleton
-/// publishers ship bare keys, which decode as `(key, None, None)` and
-/// leave the meta unset — those contracts render without a badge until
-/// some daemon publisher classifies them.
-///
-/// Returns `(topology, self_node_id)` where `self_node_id` is the
-/// graph-node id of the user's own publisher entry — `Some(addr)` /
-/// `Some("gw::remote: <prefix>")` when the user is publishing under a
-/// pubkey the contract has heard from, `None` otherwise (publish
-/// disabled, no entry yet, or running with a different identity).
+/// via `shared::contract::encode_contract_entry`. Bare keys (no probe
+/// data) decode as `(key, None, None)` and leave the meta unset —
+/// those contracts render without a badge until some daemon publisher
+/// classifies them.
 fn build_topology(
     remote: &HashMap<String, RemoteEntry>,
     known_nodes: &[KnownNode],
-    self_pubkey_hex: Option<&str>,
-) -> (Topology, Option<String>) {
+) -> Topology {
     let mut gateways = Vec::with_capacity(remote.len());
     let mut newest_ts_ms: u64 = 0;
     let mut contract_meta: BTreeMap<String, ContractMeta> = BTreeMap::new();
-    let mut self_node_id: Option<String> = None;
 
     for entry in remote.values() {
         let p = &entry.payload;
@@ -555,21 +397,6 @@ fn build_topology(
             .chars()
             .take(8)
             .collect();
-        // The graph component identifies a node by its `external_address`
-        // when present, falling back to `gw::<label>`. Mirror that
-        // convention here so `self_node_id` is the same string the
-        // layout uses as a HashMap key — flagging the right node
-        // without threading the pubkey all the way down.
-        if let Some(self_hex) = self_pubkey_hex {
-            if entry.publisher_pubkey_hex.eq_ignore_ascii_case(self_hex) {
-                let label = format!("remote: {pubkey_prefix}");
-                self_node_id = Some(if !p.external_address.is_empty() {
-                    p.external_address.clone()
-                } else {
-                    format!("gw::{label}")
-                });
-            }
-        }
 
         let peers = p
             .neighbors
@@ -635,16 +462,85 @@ fn build_topology(
             version: p.version.clone(),
             peers,
             contracts,
+            last_seen_ms: Some(p.timestamp_ms),
         });
     }
 
-    let topology = Topology {
+    Topology {
         gateways,
         known_nodes: known_nodes.to_vec(),
         contract_meta,
         fetched_at: newest_ts_ms / 1000,
-    };
-    (topology, self_node_id)
+    }
+}
+
+// ============================ selection-context highlight ============================
+
+/// Compute the "focus set" — graph node ids the graph should keep at
+/// full opacity while everything else dims out — based on the
+/// currently-selected entity. Two cases:
+///
+/// 1. **Selection is a contract key** (clicked in the Contracts list).
+///    Returns the set of publisher gateway-ids that report hosting it.
+///    Reverse-lookup: the user picks a contract row, the graph reveals
+///    "who has this".
+///
+/// 2. **Selection is a graph node id** (clicked in the Nodes list, or
+///    on the graph). Returns the node itself plus every neighbour
+///    connected via at least one edge — i.e. its 1-hop ring.
+///
+/// `None` means no highlight is active and the graph renders normally.
+fn compute_highlight_set(t: &Topology, selected: Option<&str>) -> Option<HashSet<String>> {
+    let sel = selected?;
+
+    // Case 1: contract key. Match the canonical (decoded) key only;
+    // grouped instances roll up to one canonical, so a single match
+    // surfaces the right publisher set even when the row collapsed
+    // many same-title instances.
+    let mut hosting: HashSet<String> = HashSet::new();
+    for gw in &t.gateways {
+        if gw.contracts.iter().any(|c| c.key == sel) {
+            let gw_id = gw
+                .external_address
+                .clone()
+                .unwrap_or_else(|| format!("gw::{}", gw.label));
+            hosting.insert(gw_id);
+        }
+    }
+    if !hosting.is_empty() {
+        return Some(hosting);
+    }
+
+    // Case 2: node id. Walk every gateway's peer list once; if `sel`
+    // names this gateway, all its peers join the set, and if `sel` is
+    // a peer of any gateway, that gateway joins the set. Either way
+    // the selected node itself is always included.
+    let mut set: HashSet<String> = HashSet::new();
+    set.insert(sel.to_string());
+    let mut matched = false;
+    for gw in &t.gateways {
+        let gw_id = gw
+            .external_address
+            .clone()
+            .unwrap_or_else(|| format!("gw::{}", gw.label));
+        if gw_id == sel {
+            matched = true;
+            for p in &gw.peers {
+                set.insert(p.address.clone());
+            }
+        }
+        for p in &gw.peers {
+            if p.address == sel {
+                matched = true;
+                set.insert(gw_id.clone());
+            }
+        }
+    }
+    if matched {
+        Some(set)
+    } else {
+        None
+    }
 }
 
 // ============================ flat node + contract aggregation ============================
@@ -662,6 +558,11 @@ struct FlatNode {
     version: Option<String>,
     scrape_url: Option<String>,
     peer_count: Option<usize>,
+    /// Last time the gateway behind this entry was heard from (wall-clock
+    /// ms since epoch). Used by the graph to fade publishers that
+    /// haven't reposted recently. `None` for non-gateway peers (we only
+    /// see them through someone else's report, never directly).
+    last_seen_ms: Option<u64>,
 }
 
 fn flat_nodes(t: &Topology) -> Vec<FlatNode> {
@@ -688,6 +589,14 @@ fn flat_nodes(t: &Topology) -> Vec<FlatNode> {
                 if existing.version.is_none() { existing.version = n.version.clone(); }
                 if existing.scrape_url.is_none() { existing.scrape_url = n.scrape_url.clone(); }
                 if existing.peer_count.is_none() { existing.peer_count = n.peer_count; }
+                // Keep the freshest reporting timestamp — multiple
+                // publishers may all claim the same gateway, but we
+                // care about the most recent one for staleness.
+                if let Some(ts) = n.last_seen_ms {
+                    existing.last_seen_ms = Some(
+                        existing.last_seen_ms.map_or(ts, |cur| cur.max(ts)),
+                    );
+                }
             })
             .or_insert(n);
     };
@@ -706,6 +615,7 @@ fn flat_nodes(t: &Topology) -> Vec<FlatNode> {
             version: gw.version.clone(),
             scrape_url: Some(gw.url.clone()),
             peer_count: Some(gw.peers.len()),
+            last_seen_ms: gw.last_seen_ms,
         });
         for peer in &gw.peers {
             upsert(&mut by_addr, FlatNode {
@@ -720,6 +630,7 @@ fn flat_nodes(t: &Topology) -> Vec<FlatNode> {
                 version: None,
                 scrape_url: None,
                 peer_count: None,
+                last_seen_ms: None,
             });
         }
     }
@@ -743,6 +654,7 @@ fn flat_nodes(t: &Topology) -> Vec<FlatNode> {
             version: None,
             scrape_url: None,
             peer_count: None,
+            last_seen_ms: None,
         });
     }
 
@@ -905,6 +817,79 @@ fn short_key(key: &str) -> String {
     }
 }
 
+// ============================ ring-location histogram ============================
+
+/// Bucket count for the location histogram strip. 36 ≈ one bucket per
+/// 10° of the ring — fine-grained enough to show clusters, coarse
+/// enough to absorb single-publisher noise without looking spiky.
+const HIST_BUCKETS: usize = 36;
+/// Strip dimensions in CSS pixels; matches `.ring-histogram` width
+/// constraints and the height set by the bar SVG. Kept as constants
+/// so visual tweaks live in one place.
+const HIST_WIDTH: f64 = 280.0;
+const HIST_HEIGHT: f64 = 28.0;
+
+/// Render a stacked-bar strip showing how publisher `own_location`
+/// values distribute across the ring `[0, 1)`. Helps spot clustering
+/// (which often correlates with poor routing) at a glance.
+///
+/// Source: every gateway in `t.gateways` whose `own_location` is set.
+/// Transitive peer locations are *not* counted — they're inferred,
+/// often stale, and would dilute the signal.
+fn render_ring_histogram(t: &Topology) -> Html {
+    let mut buckets = [0u32; HIST_BUCKETS];
+    let mut total = 0u32;
+    for gw in &t.gateways {
+        if let Some(loc) = gw.own_location {
+            let idx = ((loc.clamp(0.0, 1.0 - f64::EPSILON)) * HIST_BUCKETS as f64) as usize;
+            buckets[idx] = buckets[idx].saturating_add(1);
+            total = total.saturating_add(1);
+        }
+    }
+    if total == 0 {
+        return html! {};
+    }
+    let max = *buckets.iter().max().unwrap_or(&1).max(&1) as f64;
+    let bar_w = HIST_WIDTH / HIST_BUCKETS as f64;
+    let bars: Vec<Html> = buckets
+        .iter()
+        .enumerate()
+        .map(|(i, &count)| {
+            let x = i as f64 * bar_w;
+            let h = (count as f64 / max) * HIST_HEIGHT;
+            let y = HIST_HEIGHT - h;
+            // Hue mirrors the node-fill colour scheme so the bar
+            // colour matches the location it represents — visual
+            // cross-reference between graph and histogram.
+            let loc_mid = (i as f64 + 0.5) / HIST_BUCKETS as f64;
+            let hue = (loc_mid * 360.0).round() as u32;
+            let style = format!("fill: hsl({hue}, 65%, 55%);");
+            html! {
+                <rect class="hist-bar"
+                      x={x.to_string()} y={y.to_string()}
+                      width={(bar_w - 0.5).to_string()}
+                      height={h.to_string()}
+                      style={style}>
+                    <title>{ format!("loc {:.2}–{:.2}: {count} publisher(s)",
+                        i as f64 / HIST_BUCKETS as f64,
+                        (i + 1) as f64 / HIST_BUCKETS as f64) }</title>
+                </rect>
+            }
+        })
+        .collect();
+    html! {
+        <div class="ring-histogram" title="Publisher distribution across the ring (own_location)">
+            <svg viewBox={format!("0 0 {HIST_WIDTH} {HIST_HEIGHT}")}
+                 preserveAspectRatio="none">
+                { for bars }
+            </svg>
+            <div class="ring-histogram-axis">
+                <span>{"0"}</span><span>{"0.5"}</span><span>{"1"}</span>
+            </div>
+        </div>
+    }
+}
+
 // ============================ search panel + rows ============================
 
 #[allow(clippy::too_many_arguments)]
@@ -962,6 +947,8 @@ fn render_search_panel(
         html! { <button class={class} onclick={onclick}>{ label }</button> }
     };
 
+    let histogram = render_ring_histogram(t);
+
     html! {
         <>
             <h2>{ header_text }</h2>
@@ -969,6 +956,7 @@ fn render_search_panel(
                 { tab("Nodes", PersistedFilter::Nodes) }
                 { tab("Contracts", PersistedFilter::Contracts) }
             </div>
+            { histogram }
             <div class="search-row">
                 <input
                     class="search-input" type="text"
@@ -1054,6 +1042,15 @@ fn render_node_row(
         Some(FetchStatus::Unreachable { message }) => (Some("status-err"), format!("unreachable: {message}")),
         None => (None, String::new()),
     };
+    // 5-minute stale threshold matches `graph::STALE_AFTER_MS`. Kept
+    // local rather than imported so this module doesn't bring in the
+    // graph module just for one constant.
+    const STALE_AFTER_MS: u64 = 5 * 60 * 1000;
+    let now_ms = web_sys::js_sys::Date::now() as u64;
+    let is_stale = n
+        .last_seen_ms
+        .map(|ts| now_ms.saturating_sub(ts) > STALE_AFTER_MS)
+        .unwrap_or(false);
     html! {
         <div class={row_class} onclick={onclick}>
             <span class="hue-dot" style={hue_dot_style}></span>
@@ -1067,6 +1064,7 @@ fn render_node_row(
                     }
                     <span class="row-label">{ label_main }</span>
                     { if let Some(v) = &n.version { html! { <span class="row-tag">{ format!("v{v}") }</span> } } else { html!{} } }
+                    { if is_stale { html! { <span class="row-tag row-tag-stale" title="no fresh entry in >5 min">{"stale"}</span> } } else { html!{} } }
                 </div>
                 { if let Some(addr) = secondary { html! { <div class="row-sub">{ addr }</div> } } else { html!{} } }
                 <div class="row-sub">
@@ -1216,37 +1214,6 @@ fn settings_drawer(props: &SettingsDrawerProps) -> Html {
     let stop = Callback::from(|e: MouseEvent| e.stop_propagation());
     let backdrop_close = props.on_close.clone();
 
-    // Identity row needs multiple let-bindings; Yew's html! `{ ... }`
-    // accepts only single expressions, so we build the markup outside
-    // and embed by reference.
-    let identity_row: Html = {
-        let pubkey = settings::derive_pubkey_hex(&s.contract.identity_seed_hex)
-            .unwrap_or_else(|| "—".to_string());
-        let on_regen = {
-            let mutate = mutate.clone();
-            Callback::from(move |_: MouseEvent| {
-                mutate(&|s| {
-                    s.contract.identity_seed_hex = settings::generate_identity_seed_hex();
-                });
-            })
-        };
-        let pubkey_short = if pubkey.len() > 24 {
-            format!("{}…", &pubkey[..24])
-        } else {
-            pubkey.clone()
-        };
-        html! {
-            <div class="setting-row">
-                <label>{"identity (pubkey)"}</label>
-                <code class="identity-pubkey" title={pubkey.clone()}>{ pubkey_short }</code>
-                <button class="regen-btn" onclick={on_regen}
-                    title="Regenerate — abandons this contract slot, claims a new one">
-                    {"regenerate"}
-                </button>
-            </div>
-        }
-    };
-
     html! {
         <div class="drawer-backdrop" onclick={backdrop_close}>
             <div class="drawer" onclick={stop}>
@@ -1262,15 +1229,14 @@ fn settings_drawer(props: &SettingsDrawerProps) -> Html {
                 </p>
                 <ul class="hint">
                     <li>{"Live subscription to a topology contract (see "}
-                        <code>{"Network sharing"}</code>{"). Each open dashboard \
-                        with "}<code>{"publish enabled"}</code>{" \
-                        contributes a signed entry; subscribers see them all merged."}</li>
+                        <code>{"Network sharing"}</code>{"). Operator-side \
+                        "}<code>{"topology-publisher"}</code>{" daemons write \
+                        entries; this dashboard reads them."}</li>
                     <li>{"Your own "}<code>{"Known public nodes"}</code>
                         {" list (below). Anchors that appear in the graph \
-                        regardless of whether anyone has published about them, \
-                        AND are emitted as "}<code>{"neighbors"}</code>
-                        {" of every entry you publish — so other subscribers \
-                        also see them."}</li>
+                        regardless of whether any daemon has reported them \
+                        — handy for showing operator-known gateways before \
+                        anyone publishes."}</li>
                 </ul>
                 <h4>{"Known public nodes"}</h4>
                 <p class="hint">{"Each row is one peer. "}
@@ -1279,13 +1245,6 @@ fn settings_drawer(props: &SettingsDrawerProps) -> Html {
                 a freenet-core node uses to dial a peer. "}
                 <code>{"location"}</code>{" is the optional ring location \
                 (0..1) you've observed for that peer."}</p>
-                <p class="hint">
-                    {"Sandbox limitation: this webapp can't auto-discover the \
-                    local node's connected peers ("}<code>{"fetch /"}</code>
-                    {" is CORS-blocked; "}<code>{"NodeQueries"}</code>
-                    {" is rejected for webapps). Anything not entered here \
-                    will be missing from your published entry."}
-                </p>
                 {
                     s.known_nodes.iter().enumerate().map(|(idx, kn)| {
                         let on_label = {
@@ -1441,10 +1400,12 @@ fn settings_drawer(props: &SettingsDrawerProps) -> Html {
                 <p class="hint">
                     {"Subscribe to a Freenet topology contract on your local node. \
                     The dashboard receives every signed "}<code>{"EntryPayload"}</code>
-                    {" any other publisher pushes into that contract; entries \
+                    {" the operator-side daemon pushes into that contract; entries \
                     are verified against their embedded Ed25519 key before \
-                    merging. The more dashboards in the network turn "}
-                    <code>{"publish enabled"}</code>{" on, the richer the graph."}
+                    merging. The dashboard itself does "}<em>{"not"}</em>
+                    {" publish — only the "}<code>{"topology-publisher"}</code>
+                    {" daemon does. To contribute, run the daemon next to your \
+                    own freenet node."}
                 </p>
                 <div class="setting-row">
                     <label>{"enabled"}</label>
@@ -1492,74 +1453,6 @@ fn settings_drawer(props: &SettingsDrawerProps) -> Html {
                     {" Each remote entry is verified against its embedded \
                     Ed25519 public key before merging — bad signatures are dropped."}
                 </p>
-
-                <h4>{"Publish your view"}</h4>
-                <p class="hint">
-                    {"Contribute one signed entry every "}
-                    { s.contract.publish_interval_secs }
-                    {"s. The entry carries:"}
-                </p>
-                <ul class="hint">
-                    <li><code>{"public_key"}</code>{" — derived from "}
-                        <code>{"identity (pubkey)"}</code>{" below; stable per browser."}</li>
-                    <li><code>{"neighbors"}</code>{" — your "}
-                        <code>{"Known public nodes"}</code>
-                        {" list. Add rows there to widen what you publish."}</li>
-                    <li><code>{"timestamp_ms"}</code>{" — wall clock; the contract \
-                        keeps the most recent entry per "}
-                        <code>{"public_key"}</code>{"."}</li>
-                </ul>
-                <p class="hint">
-                    {"Auto-discovery of own peers / location / version is "}
-                    <em>{"not"}</em>{" possible from a sandbox iframe in the \
-                    current freenet-core (CORS + NodeQueries gates). For now, \
-                    enrich your entry by hand via "}
-                    <code>{"+ add known node"}</code>{" above. To grow the global \
-                    graph, get other operators to open this dashboard on their \
-                    own nodes and turn "}<code>{"publish enabled"}</code>{" on."}
-                </p>
-                <div class="setting-row">
-                    <label>{"publish enabled"}</label>
-                    <input type="checkbox" checked={s.contract.publish_enabled} oninput={
-                        let mutate = mutate.clone();
-                        Callback::from(move |e: InputEvent| {
-                            let v = e.target_unchecked_into::<web_sys::HtmlInputElement>().checked();
-                            mutate(&|s| s.contract.publish_enabled = v);
-                        })
-                    } />
-                    <span></span>
-                </div>
-                <div class="setting-row">
-                    <label>{"publish interval (s)"}</label>
-                    <input type="number" min="5" max="3600" step="5"
-                        value={s.contract.publish_interval_secs.to_string()}
-                        oninput={
-                            let mutate = mutate.clone();
-                            Callback::from(move |e: InputEvent| {
-                                let target: web_sys::HtmlInputElement = e.target_unchecked_into();
-                                if let Ok(v) = target.value().parse::<u32>() {
-                                    mutate(&|s| s.contract.publish_interval_secs = v);
-                                }
-                            })
-                        }
-                    />
-                    <span></span>
-                </div>
-                <div class="setting-row">
-                    <label>{"contract code hash"}</label>
-                    <input type="text" placeholder="base58 CodeHash (publish-only)"
-                        value={s.contract.code_hash.clone()}
-                        oninput={
-                            let mutate = mutate.clone();
-                            Callback::from(move |e: InputEvent| {
-                                let v: String = e.target_unchecked_into::<web_sys::HtmlInputElement>().value();
-                                mutate(&|s| s.contract.code_hash = v.clone());
-                            })
-                        }
-                    />
-                    <span></span>
-                </div>
-                { identity_row }
                 </section>
 
                 <button class="reset-btn" onclick={on_reset}>{"reset all to defaults"}</button>
@@ -1587,88 +1480,6 @@ fn contract_status_class(s: &ContractStatus) -> &'static str {
     }
 }
 
-// ============================ publisher worker ============================
-
-/// One full publish cycle.
-///
-/// Sandbox iframe limitations rule out the two paths a publisher would
-/// normally take to learn about its local node:
-///   - `fetch('/')` is CORS-blocked (iframe origin is "null").
-///   - `ClientRequest::NodeQueries` is rejected server-side for
-///     web-app clients (`client_events/websocket.rs:1386`).
-///
-/// We can't change `freenet-core`. So this publisher emits a *skeleton*
-/// `EntryPayload` carrying only the publisher's identity and the
-/// statically-configured `known_nodes` from settings. The contract
-/// state grows (a per-publisher slot exists), and any subscriber sees
-/// "publisher P is alive at timestamp T", but the rich peer/contract
-/// graph data has to come from elsewhere — currently the user's
-/// "Known public nodes" list. Future work: re-introduce auto-discovery
-/// when freenet-core exposes a webapp-safe peer-list endpoint.
-async fn publish_one_cycle(
-    holder: &Rc<RefCell<Option<ContractClient>>>,
-    sk: &SigningKey,
-    instance_id: ContractInstanceId,
-    code_hash: CodeHash,
-    known_nodes: Vec<KnownNode>,
-) -> Result<(), String> {
-    let neighbors = known_nodes
-        .into_iter()
-        .map(|n| NeighborInfo {
-            address: n.address,
-            location: n.location,
-            is_gateway: n.is_gateway,
-        })
-        .collect::<Vec<_>>();
-    let payload = EntryPayload {
-        public_key: sk.verifying_key().to_bytes(),
-        external_address: String::new(),
-        own_location: None,
-        version: None,
-        neighbors,
-        contracts: vec![],
-        timestamp_ms: now_ms(),
-    };
-    web_sys::console::log_1(
-        &format!(
-            "[net-graph publish] skeleton payload: neighbors={}",
-            payload.neighbors.len()
-        )
-        .into(),
-    );
-
-    let guard = holder.borrow();
-    let client = guard
-        .as_ref()
-        .ok_or_else(|| "subscription is not open; enable it first".to_string())?;
-    web_sys::console::log_1(&"[net-graph publish] sending Update via client.publish()".into());
-    let r = client
-        .publish(&payload, sk, instance_id, code_hash)
-        .await;
-    web_sys::console::log_1(&format!("[net-graph publish] result: {r:?}").into());
-    r
-}
-
-fn now_ms() -> u64 {
-    web_sys::js_sys::Date::now() as u64
-}
-
-fn decode_signing_key(seed_hex: &str) -> Option<SigningKey> {
-    let bytes = hex::decode(seed_hex.trim()).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut seed = [0u8; 32];
-    seed.copy_from_slice(&bytes);
-    Some(SigningKey::from_bytes(&seed))
-}
-
-fn decode_code_hash(s: &str) -> Result<CodeHash, String> {
-    let bytes = bs58::decode(s.trim())
-        .into_vec()
-        .map_err(|e| format!("base58: {e}"))?;
-    CodeHash::try_from(bytes.as_slice()).map_err(|e| format!("length: {e}"))
-}
 
 fn main() {
     // `Config::default()` sets `Level::Trace`, which makes html5ever

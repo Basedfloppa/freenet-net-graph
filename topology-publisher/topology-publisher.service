@@ -8,17 +8,28 @@ After=network-online.target freenet.service
 Wants=network-online.target
 
 [Service]
-Type=simple
+# `Type=notify` is what wires up `$NOTIFY_SOCKET` for the daemon's
+# `sd_notify` calls. With `Type=simple` (the default) systemd skips
+# the socket entirely and `WatchdogSec=` below would fire on the
+# first 180 s tick — even if the daemon is healthy — because no
+# `WATCHDOG=1` ping can ever reach the manager.
+Type=notify
 # Adjust to wherever you've installed the binary. The default cargo
 # build path is shown for reference.
 
 ExecStart=/usr/local/bin/topology-publisher \
     --node-ws-url ws://127.0.0.1:7509 \
     --interval-secs 60 \
+    --metrics-port 17071 \
     --neighbor "nova,5.9.111.215:31337" \
     --neighbor "vega,100.27.151.80:31337"
 Restart=on-failure
 RestartSec=10
+# Watchdog: every successful publish pings systemd via `sd_notify`.
+# 180 s ≈ 3× the default publish interval, so a single missed cycle
+# is forgiven; two consecutive failures or a deadlock trigger restart.
+# Tune in lockstep with `--interval-secs` if you change it.
+WatchdogSec=180
 
 # Persist the publisher's Ed25519 seed so the contract slot stays
 # stable across restarts. `~/.config/freenet-net-graph/publisher-key.toml`

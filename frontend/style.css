@@ -194,29 +194,49 @@ footer {
     to   { stroke-dashoffset: 60; }
 }
 
-/* User's own publisher entry: a steady solid ring and a small caption
- * so it's identifiable even when not selected. The colour is distinct
- * from the dashed selection halo so both can read at once when the
- * user clicks themselves. */
-.node-self-ring {
-    fill: none;
-    stroke: #f59e0b;
-    stroke-width: 2.5px;
-    pointer-events: none;
-    filter: drop-shadow(0 0 4px rgba(245, 158, 11, 0.55));
+/* Stale-publisher fade: applied to gateway circles whose latest
+ * `EntryPayload.timestamp_ms` is more than STALE_AFTER_MS old.
+ * Transitive peers (no timestamp at all) are NOT faded — they have
+ * no freshness signal of their own. */
+circle.node-stale {
+    opacity: 0.35;
 }
-.node-self-tag {
-    fill: #f59e0b;
+
+/* Selection-context dimming: nodes outside the highlight set fade
+ * into the background so the user can pick out the focused cluster.
+ * Edges that don't have both endpoints in focus are dimmed harder
+ * (lower opacity) so the focused subgraph remains visually crisp. */
+circle.node-dimmed { opacity: 0.12; transition: opacity 200ms ease; }
+line.edge-dimmed   { opacity: 0.06; transition: opacity 200ms ease; }
+.legend .swatch.stale-key {
+    opacity: 0.35;
+    background: var(--gateway);
+}
+.row-tag-stale {
+    background: rgba(255, 99, 99, 0.18);
+    color: #ff8a8a;
+}
+
+/* Ring-location histogram strip in the sidebar header. */
+.ring-histogram {
+    margin: 6px 0 8px;
+    padding: 4px 6px 0;
+    border: 1px solid var(--panel-border);
+    border-radius: 5px;
+    background: rgba(255, 255, 255, 0.02);
+}
+.ring-histogram svg {
+    width: 100%;
+    height: 28px;
+    display: block;
+}
+.ring-histogram .hist-bar { stroke: none; }
+.ring-histogram-axis {
+    display: flex;
+    justify-content: space-between;
     font-size: 10px;
-    font-weight: 600;
-    letter-spacing: 0.5px;
-    text-transform: lowercase;
-    pointer-events: none;
-}
-.legend .swatch.self-key {
-    background: transparent;
-    border: 2px solid #f59e0b;
-    box-sizing: border-box;
+    color: var(--fg-muted);
+    margin-top: 2px;
 }
 
 /* Search row + node list in the sidebar */

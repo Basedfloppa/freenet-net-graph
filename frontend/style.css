@@ -163,6 +163,13 @@ footer {
 }
 
 .legend { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+.repo-link {
+    margin-left: auto;
+    color: var(--fg-muted);
+    text-decoration: none;
+    border-bottom: 1px dashed transparent;
+}
+.repo-link:hover { color: var(--fg); border-bottom-color: var(--fg-muted); }
 .legend .swatch { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; vertical-align: middle; }
 .legend .swatch.hue-key {
     background: conic-gradient(from 0deg,
@@ -185,6 +192,31 @@ footer {
 @keyframes halo-spin {
     from { stroke-dashoffset: 0; }
     to   { stroke-dashoffset: 60; }
+}
+
+/* User's own publisher entry: a steady solid ring and a small caption
+ * so it's identifiable even when not selected. The colour is distinct
+ * from the dashed selection halo so both can read at once when the
+ * user clicks themselves. */
+.node-self-ring {
+    fill: none;
+    stroke: #f59e0b;
+    stroke-width: 2.5px;
+    pointer-events: none;
+    filter: drop-shadow(0 0 4px rgba(245, 158, 11, 0.55));
+}
+.node-self-tag {
+    fill: #f59e0b;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: lowercase;
+    pointer-events: none;
+}
+.legend .swatch.self-key {
+    background: transparent;
+    border: 2px solid #f59e0b;
+    box-sizing: border-box;
 }
 
 /* Search row + node list in the sidebar */

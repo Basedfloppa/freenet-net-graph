@@ -257,7 +257,22 @@ fn app() -> Html {
     // ---- topology built fresh from the subscription each render -----
     // No polling. The graph reflects whatever entries we've verified
     // through the contract so far, plus the user's `known_nodes` list.
-    let topo = Rc::new(build_topology(&remote_entries, &settings.known_nodes));
+    // We also derive the local publisher's pubkey hex from the seed so
+    // the graph can highlight the user's own node — but only when the
+    // user is actually publishing, otherwise highlighting any random
+    // pubkey-match would be misleading.
+    let self_pubkey_hex: Option<String> = if settings.contract.publish_enabled {
+        settings::derive_pubkey_hex(&settings.contract.identity_seed_hex)
+    } else {
+        None
+    };
+    let (built_topo, self_node_id) = build_topology(
+        &remote_entries,
+        &settings.known_nodes,
+        self_pubkey_hex.as_deref(),
+    );
+    let topo = Rc::new(built_topo);
+    let self_node_id_rc: Rc<Option<String>> = Rc::new(self_node_id);
     // Error banner now shows the contract-subscription failure state
     // (config error, WS closed, decode failure) — there's no second
     // "fetch" channel any more.
@@ -410,7 +425,12 @@ fn app() -> Html {
                      onmousedown={on_resize_start}
                      title="Drag to resize sidebar"></div>
                 <div class="graph-wrap">
-                    <graph::Graph topology={topo.clone()} selected={(*selected).clone()} layout={layout} />
+                    <graph::Graph
+                        topology={topo.clone()}
+                        selected={(*selected).clone()}
+                        self_node_id={(*self_node_id_rc).clone()}
+                        layout={layout}
+                    />
                     {
                         if publisher_count == 0 {
                             // No verified entries from the contract yet —
@@ -452,8 +472,16 @@ fn app() -> Html {
                     <span><span class="swatch" style="background: var(--gateway)"></span>{"gateway"}</span>
                     <span><span class="swatch hue-key"></span>{"node fill = location hue"}</span>
                     <span><span class="swatch" style="background: #6b7280"></span>{"location unknown"}</span>
+                    <span><span class="swatch self-key"></span>{"you"}</span>
                 </div>
                 <span>{ "Live subscription — push, not poll" }</span>
+                <a
+                    class="repo-link"
+                    href="https://github.com/Basedfloppa/freenet-net-graph"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    title="Source on GitHub"
+                >{ "freenet-net-graph @ GitHub ↗" }</a>
             </footer>
             {
                 if *drawer_open {
@@ -502,13 +530,21 @@ fn app() -> Html {
 /// publishers ship bare keys, which decode as `(key, None, None)` and
 /// leave the meta unset — those contracts render without a badge until
 /// some daemon publisher classifies them.
+///
+/// Returns `(topology, self_node_id)` where `self_node_id` is the
+/// graph-node id of the user's own publisher entry — `Some(addr)` /
+/// `Some("gw::remote: <prefix>")` when the user is publishing under a
+/// pubkey the contract has heard from, `None` otherwise (publish
+/// disabled, no entry yet, or running with a different identity).
 fn build_topology(
     remote: &HashMap<String, RemoteEntry>,
     known_nodes: &[KnownNode],
-) -> Topology {
+    self_pubkey_hex: Option<&str>,
+) -> (Topology, Option<String>) {
     let mut gateways = Vec::with_capacity(remote.len());
     let mut newest_ts_ms: u64 = 0;
     let mut contract_meta: BTreeMap<String, ContractMeta> = BTreeMap::new();
+    let mut self_node_id: Option<String> = None;
 
     for entry in remote.values() {
         let p = &entry.payload;
@@ -519,6 +555,21 @@ fn build_topology(
             .chars()
             .take(8)
             .collect();
+        // The graph component identifies a node by its `external_address`
+        // when present, falling back to `gw::<label>`. Mirror that
+        // convention here so `self_node_id` is the same string the
+        // layout uses as a HashMap key — flagging the right node
+        // without threading the pubkey all the way down.
+        if let Some(self_hex) = self_pubkey_hex {
+            if entry.publisher_pubkey_hex.eq_ignore_ascii_case(self_hex) {
+                let label = format!("remote: {pubkey_prefix}");
+                self_node_id = Some(if !p.external_address.is_empty() {
+                    p.external_address.clone()
+                } else {
+                    format!("gw::{label}")
+                });
+            }
+        }
 
         let peers = p
             .neighbors
@@ -587,12 +638,13 @@ fn build_topology(
         });
     }
 
-    Topology {
+    let topology = Topology {
         gateways,
         known_nodes: known_nodes.to_vec(),
         contract_meta,
         fetched_at: newest_ts_ms / 1000,
-    }
+    };
+    (topology, self_node_id)
 }
 
 // ============================ flat node + contract aggregation ============================

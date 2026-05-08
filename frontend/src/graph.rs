@@ -43,6 +43,12 @@ struct PhysNode {
     label: String,
     is_gateway: bool,
     is_public_default: bool,
+    /// True for the user's own publisher entry. The graph draws a
+    /// distinct ring + "you" tag so the user can find themselves
+    /// without scanning the gateway labels. Set per-render from
+    /// `GraphProps.self_node_id`, not stored across syncs (the seed
+    /// can change between renders).
+    is_self: bool,
     /// Whether the node has a known ring location (used purely as colour
     /// input now — geometry is location-agnostic).
     has_location: bool,
@@ -72,6 +78,7 @@ impl PhysNode {
             label,
             is_gateway,
             is_public_default: false,
+            is_self: false,
             has_location: location.is_some(),
             location,
             x: CENTER + seed_r * seed_a.cos(),
@@ -304,6 +311,11 @@ pub struct GraphProps {
     /// search list.
     #[prop_or_default]
     pub selected: Option<String>,
+    /// Graph-node id of the user's own publisher entry. When set, that
+    /// node renders with a coloured ring and a "you" tag so the user can
+    /// spot themselves on the graph at a glance.
+    #[prop_or_default]
+    pub self_node_id: Option<String>,
     /// User-tunable physics constants. Read every tick; changing them in
     /// the settings drawer rebalances the layout in real time without a
     /// full re-render.
@@ -347,6 +359,16 @@ pub fn graph(props: &GraphProps) -> Html {
         });
     }
 
+    // Refresh `is_self` flags every render: the prop can change (user
+    // toggles publish, regenerates seed, switches identity) without a
+    // topology resync, and we don't want the marker to lag behind.
+    {
+        let mut l = layout.borrow_mut();
+        let self_id = props.self_node_id.as_deref();
+        for n in l.nodes.values_mut() {
+            n.is_self = self_id == Some(n.id.as_str());
+        }
+    }
     let l = layout.borrow();
 
     let edges_html: Vec<Html> = l
@@ -425,9 +447,34 @@ pub fn graph(props: &GraphProps) -> Html {
                 html! {}
             };
 
+            // Self-marker: a coloured ring (slightly inside the
+            // selection halo's radius so both can coexist when the
+            // user clicks their own node) plus a small "you" caption
+            // pinned above it. Drawn under the node circle so the
+            // node fill stays readable.
+            let (self_ring, self_tag) = if n.is_self {
+                let ring = html! {
+                    <circle class="node-self-ring"
+                            cx={n.x.to_string()} cy={n.y.to_string()}
+                            r={(r + 5.0).to_string()} />
+                };
+                let tag = html! {
+                    <text class="node-self-tag"
+                          x={n.x.to_string()}
+                          y={(n.y - r - 8.0).to_string()}
+                          text-anchor="middle">
+                        { "you" }
+                    </text>
+                };
+                (ring, tag)
+            } else {
+                (html! {}, html! {})
+            };
+
             html! {
                 <g key={n.id.clone()}>
                     { halo }
+                    { self_ring }
                     <circle class={class}
                             cx={n.x.to_string()} cy={n.y.to_string()}
                             r={r.to_string()}
@@ -435,6 +482,7 @@ pub fn graph(props: &GraphProps) -> Html {
                         <title>{ tooltip(n) }</title>
                     </circle>
                     { label_node }
+                    { self_tag }
                 </g>
             }
         })

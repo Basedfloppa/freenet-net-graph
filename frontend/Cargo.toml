@@ -1,0 +1,63 @@
+[package]
+name = "frontend"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+shared = { path = "../shared" }
+yew = { version = "0.21", features = ["csr"] }
+gloo-net = "0.6"
+gloo-timers = { version = "0.3", features = ["futures"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1"
+log = "0.4"
+wasm-logger = "0.2"
+hex = "0.4"
+# `js` feature routes randomness through `crypto.getRandomValues`, which
+# we need for ed25519-dalek's signing/verifying-key generation in the
+# browser. It also satisfies any other transitive `getrandom` dep that
+# would otherwise refuse to link on `wasm32-unknown-unknown`.
+getrandom = { version = "0.2", features = ["js"] }
+# getrandom 0.3 reaches the dep tree transitively (e.g. via scraper /
+# html5ever). On wasm32 it needs the `wasm_js` feature explicitly,
+# otherwise its `inner_u64` backend doesn't compile. Adding it here as
+# a direct dep flips that feature on for the whole tree.
+getrandom_v3 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+# Ed25519 signing in the browser, for the in-tab publisher worker. The
+# `alloc` feature lets it compile without `std` integration weirdness;
+# verification was already used (transitively via shared/contract) so
+# this is mostly about exposing `SigningKey` directly to the frontend.
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "zeroize"] }
+# HTML scraper reused from the (now-deprecated) backend pipeline. The
+# webapp-contract publisher fetches `/` from the same origin and runs
+# this on the response.
+scraper-lib = { path = "../scraper" }
+bs58 = "0.5"
+# Browser-side client for the freenet-core WebSocket API: gives us
+# `client_api::WebApi` (the wasm32 variant uses `web_sys::WebSocket`)
+# plus `ClientRequest` / `HostResponse` types. The `net` feature is
+# target-gated in stdlib's Cargo.toml, so on wasm32 we get only the
+# wasm-bindgen / web-sys / js-sys deps without tokio.
+# Use the crates.io-published 0.6.1 to match the wire format spoken by
+# freenet-core nodes built from `freenet-stdlib = "0.6.1"`. The local
+# 0.7.0 path-dep introduced bincode-incompatible enum variants in
+# `ClientRequest`/`HostResponse`, so node responses (e.g. SubscribeResponse)
+# couldn't be deserialized in the browser and Update payloads couldn't
+# be parsed server-side. Stay on 0.6.1 until nodes upgrade.
+freenet-stdlib = { version = "0.6.1", features = ["net"] }
+web-sys = { version = "0.3", features = ["HtmlInputElement", "HtmlSelectElement", "Navigator", "Clipboard", "Storage", "WebSocket"] }
+base64 = "0.22.1"
+
+# Override stdlib 0.6.1 with a locally-patched copy that switches the
+# browser-side WebApi to receive ArrayBuffer instead of Blob+FileReader.
+# Inside a sandboxed iframe (opaque "null" origin) the FileReader path
+# never delivered the SubscribeResponse / UpdateResult frames, leaving
+# the dashboard stuck at "subscribing…" and silently dropping outgoing
+# Updates. Switching to an arraybuffer binaryType receives bytes
+# synchronously on the message event and avoids the FileReader detour.
+[patch.crates-io]
+freenet-stdlib = { path = "../stdlib-0.6.1-patched" }

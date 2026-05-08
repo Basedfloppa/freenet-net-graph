@@ -1,0 +1,32 @@
+[Unit]
+Description=Freenet topology publisher (off-tab daemon)
+Documentation=https://github.com/freenet/freenet-net-graph
+# Wait for the local freenet node so the daemon's first WS connect
+# doesn't immediately fail. `freenet.service` is the convention used
+# by the operator's own systemd unit; rename if your unit differs.
+After=network-online.target freenet.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Adjust to wherever you've installed the binary. The default cargo
+# build path is shown for reference.
+ExecStart=/usr/local/bin/topology-publisher \
+    --node-ws-url ws://127.0.0.1:7509 \
+    --interval-secs 60 \
+    --label %H \
+    --neighbor "nova,5.9.111.215:31337" \
+    --neighbor "vega,100.27.151.80:31337"
+Restart=on-failure
+RestartSec=10
+
+# Persist the publisher's Ed25519 seed so the contract slot stays
+# stable across restarts. `~/.config/freenet-net-graph/publisher-key.toml`
+# is the default; override with `--key-file <path>` above if needed.
+Environment=RUST_LOG=topology_publisher=info,warn
+# Run as the same user that owns ~/.config/freenet for key access.
+# Override `User=` to match your deployment.
+# User=freenet
+
+[Install]
+WantedBy=multi-user.target

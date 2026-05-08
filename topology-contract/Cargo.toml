@@ -1,0 +1,36 @@
+[package]
+name = "topology-contract"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+shared = { path = "../shared" }
+freenet-stdlib = { path = "../../freenet-stdlib/rust", features = ["contract"] }
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
+
+# Feature wiring expected by `fdev build` for a standard contract crate.
+# `fdev` invokes cargo with `--features contract,freenet-main-contract`,
+# which gates the `#[no_mangle]` extern functions that the `#[contract]`
+# macro generates. Without `freenet-main-contract`, the WASM has the
+# trait impl but no exported entrypoints — runtime can't call into it.
+[features]
+default = ["freenet-main-contract"]
+contract = ["freenet-stdlib/contract"]
+freenet-main-contract = []
+
+[dev-dependencies]
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[workspace]

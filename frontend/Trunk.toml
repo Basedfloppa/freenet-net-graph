@@ -1,0 +1,23 @@
+[build]
+target = "index.html"
+dist = "dist"
+# Disable Subresource Integrity. The dashboard is served inside the
+# freenet sandbox iframe (`?__sandbox=1`), which makes the document
+# origin opaque ("null"). Browsers require CORS for SRI checks, and
+# same-origin assets under an opaque-origin iframe fail that check —
+# so the CSS/JS get blocked with `Subresource Integrity ... requires
+# the request to be CORS enabled` even though everything is loading
+# from the same node.
+no_sri = true
+# Prefix every asset URL the bundler emits with the published contract
+# path. Without this trunk produces absolute paths like
+# `/frontend-…js`, which 404 inside the freenet sandbox iframe (the
+# iframe loads at `/v1/contract/web/<key>/?__sandbox=1`, so absolute-
+# from-host URLs miss the contract scope). The instance_id below is
+# stable across `fdev website update` runs because it depends on the
+# website-keys/net-graph.toml signing key, not on bundle content.
+public_url = "/v1/contract/web/HDNhnuFs6C1Rp1i2wpMvAcMLWvaRbgaNqHpropGQvPZr/"
+
+[serve]
+address = "127.0.0.1"
+port = 9000

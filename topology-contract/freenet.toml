@@ -1,0 +1,8 @@
+# Manifest read by `fdev build`. Tells fdev that this crate compiles to
+# a "standard" data contract written in Rust — no webapp bundling, no
+# auto-generated state. Initial state is supplied at publish time via
+# `fdev publish ... --state <path>`.
+
+[contract]
+type = "standard"
+lang = "rust"

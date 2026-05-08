@@ -49,9 +49,13 @@ Manual:
 ```bash
 topology-publisher \
     --node-ws-url ws://127.0.0.1:7509 \
-    --interval-secs 60 \
-    --label "$(hostname)"
+    --interval-secs 60
 ```
+
+(Don't pass `--label "$(hostname)"` — that ships your machine name
+into the public `EntryPayload.version` field. See the `--label`
+note in [Adding a new publisher](#adding-a-new-publisher) for the
+privacy rationale.)
 
 Systemd:
 
@@ -127,7 +131,6 @@ a template. The defaults match the public deployment:
 ExecStart=/usr/local/bin/topology-publisher \
     --node-ws-url ws://127.0.0.1:7509 \
     --interval-secs 60 \
-    --label %H \
     --neighbor "nova,5.9.111.215:31337" \
     --neighbor "vega,100.27.151.80:31337"
 ```
@@ -135,8 +138,12 @@ ExecStart=/usr/local/bin/topology-publisher \
 Things to consider:
 
 - **`--label`** is a free-text string that ends up in
-  `EntryPayload.version`; subscribers use it to tell publishers apart
-  in tooltips. `%H` (the hostname) is a fine default.
+  `EntryPayload.version`; subscribers see it on each publisher's
+  tooltip. **Do not** pass `%H` / `$(hostname)` — your machine name
+  leaks publicly to every dashboard. Leave it out and the
+  `remote: <pubkey-prefix>` label is sufficient for distinguishing
+  publishers; pass a non-identifying value (region code, role
+  name) only if you actually want one.
 - **`--neighbor`** entries are *only* used when the daemon is talking
   to a `local`-mode node (NodeQueries unavailable). On a real network
   node you can omit them — the live `NodeDiagnostics` peer list

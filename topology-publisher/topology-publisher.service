@@ -11,10 +11,10 @@ Wants=network-online.target
 Type=simple
 # Adjust to wherever you've installed the binary. The default cargo
 # build path is shown for reference.
+
 ExecStart=/usr/local/bin/topology-publisher \
     --node-ws-url ws://127.0.0.1:7509 \
     --interval-secs 60 \
-    --label %H \
     --neighbor "nova,5.9.111.215:31337" \
     --neighbor "vega,100.27.151.80:31337"
 Restart=on-failure

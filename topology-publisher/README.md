@@ -63,8 +63,8 @@ restarts the process within ~3 minutes.
 | Flag | Default | Notes |
 | --- | --- | --- |
 | `--node-ws-url <URL>` | `ws://127.0.0.1:7509` | Local freenet node's WS endpoint. Path is appended automatically. |
-| `--instance-id <BASE58>` | (production contract) | Topology contract instance id. Override only for staging/test contracts. |
-| `--code-hash <BASE58>` | (production contract) | WASM code hash for the topology contract. |
+| `--instance-id <BASE58>` | `BRQiAyN4VSWRp6sW6Xvt2B6RmHyp6dQFFZhStvpnLUkE` | Topology contract instance id. Override only for a staging/test contract. |
+| `--code-hash <BASE58>` | `3Ug134jfYzEMkwJeRbTEgY33kgXHKEWnZLvmWi3eoDXV` | WASM code hash for the topology contract above. |
 | `--interval-secs <N>` | `60` | Publish cadence. |
 | `--key-file <PATH>` | `~/.config/freenet-net-graph/publisher-key.toml` | Where the publisher's Ed25519 seed lives. |
 | `--display-name <NAME>` | none | Operator-chosen public nickname. Shows in the dashboard as the gateway label (e.g. "baka", "orange"). `--label` is kept as a deprecated alias. |

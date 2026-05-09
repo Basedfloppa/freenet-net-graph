@@ -6,6 +6,29 @@ push signed snapshots of their node's peer/contract state into the
 contract; every visitor's dashboard subscribes, verifies the Ed25519
 signatures, and renders a live force-directed graph.
 
+## Open it
+
+Any node hosting the dashboard webapp serves it at
+`/v1/contract/web/<dashboard-contract>/`. Pick a freenet node you can
+reach — your own, or one of the operator-run anchors — and replace
+`<host>` with its address:
+
+```
+http://<host>:7509/v1/contract/web/HDNhnuFs6C1Rp1i2wpMvAcMLWvaRbgaNqHpropGQvPZr/
+```
+
+| Contract | Base58 id | What it is |
+| --- | --- | --- |
+| **Dashboard webapp** | `HDNhnuFs6C1Rp1i2wpMvAcMLWvaRbgaNqHpropGQvPZr` | The Yew SPA you're opening — bundle + index.html. |
+| **Topology data** | `BRQiAyN4VSWRp6sW6Xvt2B6RmHyp6dQFFZhStvpnLUkE` | The signed-entry LWW state every publisher writes into and every dashboard subscribes to. Instance id baked into both [`frontend/src/settings.rs`](./frontend/src/settings.rs) (subscriber default) and [`topology-publisher/src/main.rs`](./topology-publisher/src/main.rs) (publisher default). |
+| **Topology code hash** | `3Ug134jfYzEMkwJeRbTEgY33kgXHKEWnZLvmWi3eoDXV` | WASM contract code hash for the topology data contract — passed to `fdev` on `Update`. Daemon default. |
+
+If you're running your own node and `fdev publish`'d a different
+topology contract, point the daemon at it with `--instance-id <BASE58>
+--code-hash <BASE58>`; the dashboard's `instance_id` setting is baked
+in for the public deployment but [`settings.rs`](./frontend/src/settings.rs)
+makes it trivial to change for a fork.
+
 ## Layout
 
 ```

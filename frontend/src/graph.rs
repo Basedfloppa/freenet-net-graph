@@ -28,9 +28,76 @@ use std::rc::Rc;
 
 use gloo_timers::callback::Interval;
 use shared::Topology;
+use web_sys::{MouseEvent, WheelEvent};
 use yew::prelude::*;
 
 use crate::settings::LayoutSettings;
+
+/// Affine transform applied to the entire scene `<g>`. Pure visual —
+/// the physics simulation runs in untransformed viewBox coords, so
+/// pan/zoom never disturbs node positions or springs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ViewState {
+    tx: f64,
+    ty: f64,
+    scale: f64,
+}
+
+impl Default for ViewState {
+    fn default() -> Self {
+        Self { tx: 0.0, ty: 0.0, scale: 1.0 }
+    }
+}
+
+/// Cursor-drag bookkeeping kept in a `RefCell` so onmousemove can
+/// update it without re-rendering. Re-render happens when we commit
+/// a new transform via `view.set(...)`.
+#[derive(Default)]
+struct DragState {
+    active: bool,
+    last_client_x: f64,
+    last_client_y: f64,
+}
+
+/// Zoom factor per wheel-tick. ~15 % per notch is the sweet spot
+/// between "feels responsive" and "single tick blew past the area I
+/// was looking at". Bounded by `MIN_SCALE`/`MAX_SCALE` below.
+const ZOOM_STEP: f64 = 1.15;
+const MIN_SCALE: f64 = 0.1;
+const MAX_SCALE: f64 = 10.0;
+
+/// Convert client-space pixel coords (from a `MouseEvent`) into the
+/// SVG's `viewBox` units, accounting for `xMidYMid meet` letterboxing.
+/// Returns `(VIEWBOX/2, VIEWBOX/2)` if the SVG isn't laid out yet —
+/// the caller treats that as "centre".
+fn client_to_viewbox(svg: &web_sys::Element, client_x: f64, client_y: f64) -> (f64, f64) {
+    let rect = svg.get_bounding_client_rect();
+    let bw = rect.width();
+    let bh = rect.height();
+    if bw <= 0.0 || bh <= 0.0 {
+        return (CENTER, CENTER);
+    }
+    let scale_factor = bw.min(bh) / VIEWBOX;
+    let off_x = (bw - VIEWBOX * scale_factor) / 2.0;
+    let off_y = (bh - VIEWBOX * scale_factor) / 2.0;
+    let vbx = (client_x - rect.left() - off_x) / scale_factor;
+    let vby = (client_y - rect.top() - off_y) / scale_factor;
+    (vbx, vby)
+}
+
+/// Multiplier that turns a one-pixel client-space delta into viewBox
+/// units. Same letterbox math as `client_to_viewbox`, just the scale
+/// component — used by the pan handler so a 10 px drag moves the
+/// scene by exactly the same amount in any zoom level.
+fn px_to_viewbox_scale(svg: &web_sys::Element) -> f64 {
+    let rect = svg.get_bounding_client_rect();
+    let bw = rect.width();
+    let bh = rect.height();
+    if bw <= 0.0 || bh <= 0.0 {
+        return 1.0;
+    }
+    VIEWBOX / bw.min(bh)
+}
 
 /// SVG coordinate space. Not user-tunable — all positions / radii in this
 /// module are written in these units, and `preserveAspectRatio="xMidYMid
@@ -104,6 +171,21 @@ struct LayoutState {
     /// "warmup" steps right after a sync, so newly-inserted clusters reach
     /// their resting position quickly without visible churn.
     ticks_since_sync: u32,
+    /// Node currently being dragged by the user, if any. Set by the
+    /// `onmousedown` handler on a circle and cleared on `mouseup`. While
+    /// `Some`, `step()` skips the physics integration for that node and
+    /// pins its position to `(target_x, target_y)` so the cursor leads
+    /// it without fighting against repulsion / spring forces. Other
+    /// nodes still feel forces from it, so the surrounding cluster
+    /// reshapes around the drag in real time.
+    pinned: Option<PinnedDrag>,
+}
+
+#[derive(Clone, Debug)]
+struct PinnedDrag {
+    node_id: String,
+    target_x: f64,
+    target_y: f64,
 }
 
 impl LayoutState {
@@ -217,6 +299,14 @@ impl LayoutState {
         // Drop nodes that disappeared from the topology so the graph shrinks
         // when the user removes a gateway from `--gateway` flags.
         self.nodes.retain(|id, _| new_ids.contains(id));
+        // If the user was dragging a node that just got removed (e.g. its
+        // publisher went silent), drop the pin so step() doesn't keep
+        // looking up a vanished id.
+        if let Some(p) = &self.pinned {
+            if !self.nodes.contains_key(&p.node_id) {
+                self.pinned = None;
+            }
+        }
         self.edges = new_edges;
         self.ticks_since_sync = 0;
     }
@@ -237,21 +327,18 @@ impl LayoutState {
             forces.insert(id.clone(), (0.0, 0.0));
         }
 
-        // Centre gravity, with a soft viewport clamp: linear inside the
-        // soft-clamp radius, quadratic outside.
+        // Centre gravity, *without* the radius-based clamp. Pan/zoom
+        // makes the on-screen viewport portable — pulling distant
+        // clusters back to the canvas centre would fight against the
+        // user actively panning to look at them. Linear gravity at
+        // `k_gravity` still keeps the swarm cohesive when no force
+        // is dragging it elsewhere; users who want a tighter pull
+        // can crank `k_gravity` from the settings drawer.
         for (id, n) in &self.nodes {
             let dx = n.x - CENTER;
             let dy = n.y - CENTER;
-            let r2 = dx * dx + dy * dy;
-            let r = r2.sqrt();
-            let scale = if r > l.soft_clamp_radius {
-                let over = r - l.soft_clamp_radius;
-                l.k_gravity + over * 0.0008
-            } else {
-                l.k_gravity
-            };
-            let fx = -scale * dx;
-            let fy = -scale * dy;
+            let fx = -l.k_gravity * dx;
+            let fy = -l.k_gravity * dy;
             let f = forces.get_mut(id).unwrap();
             f.0 += fx;
             f.1 += fy;
@@ -303,7 +390,16 @@ impl LayoutState {
             }
         }
 
+        let pinned_id = self.pinned.as_ref().map(|p| p.node_id.clone());
         for (id, n) in self.nodes.iter_mut() {
+            if pinned_id.as_deref() == Some(id.as_str()) {
+                // Pinned node: forces still apply to *other* nodes
+                // (they react around the cursor), but this one's
+                // motion is overridden — we set its position to the
+                // drag target and zero its velocity so on release it
+                // doesn't fly away from accumulated impulse.
+                continue;
+            }
             if let Some(&(fx, fy)) = forces.get(id) {
                 n.vx = (n.vx + fx) * l.damping;
                 n.vy = (n.vy + fy) * l.damping;
@@ -314,6 +410,18 @@ impl LayoutState {
                 }
                 n.x += n.vx;
                 n.y += n.vy;
+            }
+        }
+
+        // Snap the pinned node to its drag target after the force
+        // pass, so other nodes see it at the cursor position rather
+        // than its pre-step location.
+        if let Some(p) = &self.pinned {
+            if let Some(n) = self.nodes.get_mut(&p.node_id) {
+                n.x = p.target_x;
+                n.y = p.target_y;
+                n.vx = 0.0;
+                n.vy = 0.0;
             }
         }
 
@@ -347,6 +455,14 @@ pub struct GraphProps {
 pub fn graph(props: &GraphProps) -> Html {
     let layout: Rc<RefCell<LayoutState>> = use_mut_ref(LayoutState::default);
     let tick = use_state(|| 0u64);
+
+    // Pan/zoom state. `view` triggers re-render on commit; `drag` lives
+    // in a RefCell so onmousemove can update its bookkeeping without a
+    // re-render storm — only the actual transform set via `view.set()`
+    // re-paints the SVG.
+    let view = use_state(ViewState::default);
+    let drag: Rc<RefCell<DragState>> = use_mut_ref(DragState::default);
+    let svg_ref = use_node_ref();
 
     {
         let layout = layout.clone();
@@ -424,102 +540,295 @@ pub fn graph(props: &GraphProps) -> Html {
     // its timestamp ages instead of flipping at the next sync.
     let now_ms = web_sys::js_sys::Date::now() as u64;
 
-    let nodes_html: Vec<Html> = l
-        .nodes
-        .values()
-        .map(|n| {
-            let (class, r) = if n.is_public_default {
-                ("node-public-gw", 11.0)
-            } else if n.is_gateway {
-                ("node-gw", 10.0)
-            } else if n.has_location {
-                ("node-peer", 6.5)
-            } else {
-                ("node-floating", 5.5)
-            };
+    // Render in three layered passes so text never gets clipped by
+    // edges or other circles. SVG paint order is document order, so
+    // the last group drawn wins:
+    //   1. edges (bottom)        — `edges_html` above
+    //   2. circles + halos       — `circles_html`
+    //   3. text labels (top)     — `labels_html`
+    // Earlier we packed each node's circle + label into one `<g>`,
+    // which let circle-of-node-B paint over label-of-node-A whenever
+    // they overlapped on the canvas. Splitting fixes that: every
+    // label is drawn after every circle.
+    let mut circles_html: Vec<Html> = Vec::with_capacity(l.nodes.len());
+    let mut labels_html: Vec<Html> = Vec::new();
 
-            // Stale fade: only applied when we have a timestamp at all
-            // (transitive peers stay normal-opacity — we have no signal
-            // on their freshness, dimming them would be misleading).
-            let is_stale = n
-                .last_seen_ms
-                .map(|ts| now_ms.saturating_sub(ts) > STALE_AFTER_MS)
-                .unwrap_or(false);
-            let is_focus_dimmed = match focus {
-                Some(fset) => !fset.contains(&n.id),
-                None => false,
+    for n in l.nodes.values() {
+        let (class, r) = if n.is_public_default {
+            ("node-public-gw", 11.0)
+        } else if n.is_gateway {
+            ("node-gw", 10.0)
+        } else if n.has_location {
+            ("node-peer", 6.5)
+        } else {
+            ("node-floating", 5.5)
+        };
+
+        // Stale fade: only applied when we have a timestamp at all
+        // (transitive peers stay normal-opacity — we have no signal
+        // on their freshness, dimming them would be misleading).
+        let is_stale = n
+            .last_seen_ms
+            .map(|ts| now_ms.saturating_sub(ts) > STALE_AFTER_MS)
+            .unwrap_or(false);
+        let is_focus_dimmed = match focus {
+            Some(fset) => !fset.contains(&n.id),
+            None => false,
+        };
+        let circle_class = classes!(
+            class,
+            is_stale.then_some("node-stale"),
+            is_focus_dimmed.then_some("node-dimmed"),
+        );
+
+        // Fill is the location hue. No-location nodes get a neutral grey.
+        let fill_style = match n.location {
+            Some(loc) => {
+                let hue = (loc.clamp(0.0, 1.0) * 360.0).round() as u32;
+                format!("fill: hsl({hue}, 65%, 55%);")
+            }
+            None => "fill: #6b7280;".to_string(),
+        };
+
+        let halo = if selected_id.as_deref() == Some(n.id.as_str()) {
+            html! {
+                <circle class="node-halo"
+                        cx={n.x.to_string()} cy={n.y.to_string()}
+                        r={(r + 8.0).to_string()} />
+            }
+        } else {
+            html! {}
+        };
+
+        // Per-circle mousedown to start a node-drag. We `stop_propagation`
+        // so the SVG-level pan handler doesn't *also* fire (a single
+        // mousedown means "either pan OR drag a node, not both"). The
+        // cursor → world transform applies the inverse of the pan/zoom
+        // ViewState so a drag works the same at any zoom level.
+        let on_node_mousedown = {
+            let layout = layout.clone();
+            let svg_ref = svg_ref.clone();
+            let view_handle = view.clone();
+            let node_id = n.id.clone();
+            Callback::from(move |e: MouseEvent| {
+                if e.button() != 0 {
+                    return;
+                }
+                e.stop_propagation();
+                e.prevent_default();
+                let Some(svg) = svg_ref.cast::<web_sys::Element>() else { return };
+                let (vbx, vby) =
+                    client_to_viewbox(&svg, e.client_x() as f64, e.client_y() as f64);
+                let v = *view_handle;
+                let world_x = (vbx - v.tx) / v.scale;
+                let world_y = (vby - v.ty) / v.scale;
+                layout.borrow_mut().pinned = Some(PinnedDrag {
+                    node_id: node_id.clone(),
+                    target_x: world_x,
+                    target_y: world_y,
+                });
+            })
+        };
+
+        circles_html.push(html! {
+            <g key={n.id.clone()}>
+                { halo }
+                <circle class={circle_class}
+                        cx={n.x.to_string()} cy={n.y.to_string()}
+                        r={r.to_string()}
+                        style={fill_style}
+                        onmousedown={on_node_mousedown}>
+                    <title>{ tooltip(n, now_ms) }</title>
+                </circle>
+            </g>
+        });
+
+        let show_label = n.is_gateway || n.is_public_default;
+        if show_label {
+            let label_dx = if n.x >= CENTER { 12.0 } else { -12.0 };
+            let label_anchor = if n.x >= CENTER { "start" } else { "end" };
+            let trimmed = trim_label(&n.label);
+            let label_class = if n.is_public_default {
+                "node-label node-label-public"
+            } else {
+                "node-label node-label-gw"
             };
-            let class = classes!(
-                class,
-                is_stale.then_some("node-stale"),
+            // Dim labels of out-of-focus nodes the same way their
+            // circles dim, so the focused subgraph reads as one piece
+            // (label + circle move together).
+            let label_class = classes!(
+                label_class,
                 is_focus_dimmed.then_some("node-dimmed"),
             );
-
-            // Fill is the location hue. No-location nodes get a neutral grey.
-            let fill_style = match n.location {
-                Some(loc) => {
-                    let hue = (loc.clamp(0.0, 1.0) * 360.0).round() as u32;
-                    format!("fill: hsl({hue}, 65%, 55%);")
-                }
-                None => "fill: #6b7280;".to_string(),
-            };
-
-            let show_label = n.is_gateway || n.is_public_default;
-            let label_node = if show_label {
-                let label_dx = if n.x >= CENTER { 12.0 } else { -12.0 };
-                let label_anchor = if n.x >= CENTER { "start" } else { "end" };
-                let trimmed = trim_label(&n.label);
-                let label_class = if n.is_public_default {
-                    "node-label node-label-public"
-                } else {
-                    "node-label node-label-gw"
-                };
-                html! {
-                    <text class={label_class}
-                          x={(n.x + label_dx).to_string()}
-                          y={(n.y + 4.0).to_string()}
-                          text-anchor={label_anchor}>
-                        { trimmed }
-                    </text>
-                }
-            } else {
-                html! {}
-            };
-
-            let halo = if selected_id.as_deref() == Some(n.id.as_str()) {
-                html! {
-                    <circle class="node-halo"
-                            cx={n.x.to_string()} cy={n.y.to_string()}
-                            r={(r + 8.0).to_string()} />
-                }
-            } else {
-                html! {}
-            };
-
-            html! {
-                <g key={n.id.clone()}>
-                    { halo }
-                    <circle class={class}
-                            cx={n.x.to_string()} cy={n.y.to_string()}
-                            r={r.to_string()}
-                            style={fill_style}>
-                        <title>{ tooltip(n, now_ms) }</title>
-                    </circle>
-                    { label_node }
-                </g>
-            }
-        })
-        .collect();
+            labels_html.push(html! {
+                <text class={label_class}
+                      x={(n.x + label_dx).to_string()}
+                      y={(n.y + 4.0).to_string()}
+                      text-anchor={label_anchor}>
+                    { trimmed }
+                </text>
+            });
+        }
+    }
 
     let _ = *tick; // depend on tick so the component re-renders each frame
 
+    // ---- pan + zoom handlers --------------------------------------
+    // The transform is applied via `<g transform="translate(tx, ty)
+    // scale(s)">` wrapping the entire scene. Pan delta arrives in
+    // client px and is converted to viewBox units so a drag of N px
+    // moves the scene by exactly N px regardless of current zoom.
+    // Zoom is anchored to the cursor: the world-space point under
+    // the mouse stays under the mouse after the transform changes.
+
+    let onmousedown = {
+        let drag = drag.clone();
+        Callback::from(move |e: MouseEvent| {
+            // Only the primary button initiates pan — middle/right
+            // are reserved for native browser behaviour (paste,
+            // context menu) which we don't want to swallow.
+            if e.button() != 0 {
+                return;
+            }
+            e.prevent_default();
+            let mut d = drag.borrow_mut();
+            d.active = true;
+            d.last_client_x = e.client_x() as f64;
+            d.last_client_y = e.client_y() as f64;
+        })
+    };
+
+    let onmousemove = {
+        let drag = drag.clone();
+        let view = view.clone();
+        let svg_ref = svg_ref.clone();
+        let layout = layout.clone();
+        Callback::from(move |e: MouseEvent| {
+            // Node drag takes priority over pan: the circle's own
+            // mousedown set `layout.pinned`, and every subsequent
+            // mousemove updates that pin's target to follow the
+            // cursor in world coords. Pan only kicks in when no
+            // node is being dragged.
+            let pinned_active = layout.borrow().pinned.is_some();
+            if pinned_active {
+                let Some(svg) = svg_ref.cast::<web_sys::Element>() else { return };
+                let (vbx, vby) =
+                    client_to_viewbox(&svg, e.client_x() as f64, e.client_y() as f64);
+                let v = *view;
+                let world_x = (vbx - v.tx) / v.scale;
+                let world_y = (vby - v.ty) / v.scale;
+                if let Some(p) = layout.borrow_mut().pinned.as_mut() {
+                    p.target_x = world_x;
+                    p.target_y = world_y;
+                }
+                return;
+            }
+            let (dx_px, dy_px) = {
+                let mut d = drag.borrow_mut();
+                if !d.active {
+                    return;
+                }
+                let dx = e.client_x() as f64 - d.last_client_x;
+                let dy = e.client_y() as f64 - d.last_client_y;
+                d.last_client_x = e.client_x() as f64;
+                d.last_client_y = e.client_y() as f64;
+                (dx, dy)
+            };
+            let Some(svg) = svg_ref.cast::<web_sys::Element>() else { return };
+            let k = px_to_viewbox_scale(&svg);
+            let mut v = *view;
+            v.tx += dx_px * k;
+            v.ty += dy_px * k;
+            view.set(v);
+        })
+    };
+
+    let stop_drag = {
+        let drag = drag.clone();
+        let layout = layout.clone();
+        Callback::from(move |_: MouseEvent| {
+            drag.borrow_mut().active = false;
+            // Releasing the mouse hands the node back to physics. We
+            // don't keep it pinned because subsequent drags would have
+            // to dislodge an invisible anchor — surprising UX.
+            layout.borrow_mut().pinned = None;
+        })
+    };
+
+    let onwheel = {
+        let view = view.clone();
+        let svg_ref = svg_ref.clone();
+        Callback::from(move |e: WheelEvent| {
+            // Without prevent_default the wheel event bubbles up and
+            // scrolls the surrounding page; on a full-viewport graph
+            // that ejects the user from the dashboard.
+            e.prevent_default();
+            let factor = if e.delta_y() < 0.0 { ZOOM_STEP } else { 1.0 / ZOOM_STEP };
+            let Some(svg) = svg_ref.cast::<web_sys::Element>() else { return };
+            let (vbx, vby) =
+                client_to_viewbox(&svg, e.client_x() as f64, e.client_y() as f64);
+            let v = *view;
+            let new_scale = (v.scale * factor).clamp(MIN_SCALE, MAX_SCALE);
+            let f_eff = new_scale / v.scale;
+            // Anchor the world-space point under the cursor: solving
+            // `vb = new_tx + new_scale * world` for new_tx given the
+            // pre-zoom mapping `world = (vb - tx) / scale`.
+            let new_tx = vbx - f_eff * (vbx - v.tx);
+            let new_ty = vby - f_eff * (vby - v.ty);
+            view.set(ViewState { tx: new_tx, ty: new_ty, scale: new_scale });
+        })
+    };
+
+    let on_reset_view = {
+        let view = view.clone();
+        Callback::from(move |_: MouseEvent| view.set(ViewState::default()))
+    };
+
+    // `graph-grabbing` flips the cursor to `grabbing` for either kind
+    // of drag (pan = the whole scene, or node = a single circle), so
+    // the user gets the same visual feedback during both gestures.
+    let dragging_now = drag.borrow().active || layout.borrow().pinned.is_some();
+    let svg_class = classes!(
+        "graph",
+        dragging_now.then_some("graph-grabbing"),
+    );
+    let transform = format!(
+        "translate({:.2} {:.2}) scale({:.4})",
+        view.tx, view.ty, view.scale
+    );
+    // Show the reset chip only when the view has been moved away
+    // from identity — otherwise it's clutter on first paint.
+    let view_dirty = view.tx != 0.0 || view.ty != 0.0 || (view.scale - 1.0).abs() > 1e-6;
+
     html! {
-        <svg class="graph"
-             viewBox={format!("0 0 {VIEWBOX} {VIEWBOX}")}
-             preserveAspectRatio="xMidYMid meet">
-            { for edges_html }
-            { for nodes_html }
-        </svg>
+        <>
+            <svg class={svg_class}
+                 ref={svg_ref}
+                 viewBox={format!("0 0 {VIEWBOX} {VIEWBOX}")}
+                 preserveAspectRatio="xMidYMid meet"
+                 onmousedown={onmousedown}
+                 onmousemove={onmousemove}
+                 onmouseup={stop_drag.clone()}
+                 onmouseleave={stop_drag}
+                 onwheel={onwheel}>
+                <g transform={transform}>
+                    { for edges_html }
+                    { for circles_html }
+                    { for labels_html }
+                </g>
+            </svg>
+            {
+                if view_dirty {
+                    html! {
+                        <button class="graph-reset-view"
+                                onclick={on_reset_view}
+                                title={format!("zoom {:.2}× — click to reset", view.scale)}>
+                            { format!("⟲ reset ({:.1}×)", view.scale) }
+                        </button>
+                    }
+                } else { html! {} }
+            }
+        </>
     }
 }
 

@@ -54,6 +54,13 @@ pub struct ContractMeta {
     /// Wall-clock seconds since epoch when this entry was filled. Lets
     /// the backend expire stale entries (e.g. retry failed probes).
     pub probed_at: u64,
+    /// Base58 WASM code hash, when the publisher shipped one (newer
+    /// daemons only). Same `code_hash` across multiple instance ids
+    /// proves they run identical code → same app, even if state /
+    /// title differ. `#[serde(default)]` for back-compat with older
+    /// publishers that don't set it.
+    #[serde(default)]
+    pub code_hash: Option<String>,
 }
 
 /// A statically-injected node — a known public gateway whose dashboard the

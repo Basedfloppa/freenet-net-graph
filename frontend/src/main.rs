@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::rc::Rc;
 
 use gloo_timers::callback::Timeout;
-use shared::contract::decode_contract_entry;
+use shared::contract::{decode_contract_entry, DecodedContractEntry};
 use shared::{ContractMeta, ContractView, FetchStatus, GatewayView, KnownNode, PeerView, Topology};
 use wasm_bindgen_futures::JsFuture;
 use yew::prelude::*;
@@ -16,10 +16,63 @@ mod ws_shim;
 use contract_client::{ContractClient, ContractStatus, RemoteEntry};
 use settings::{LayoutSettings, PersistedFilter, Settings};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum ItemKind {
-    Node,
-    Contract,
+/// User-controllable filter facets applied on top of the text query.
+/// Each variant defaults to "any" so the filter is opt-in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContractFilter {
+    /// Contract kind filter — webapp / data-only / unprobed / any.
+    kind: ContractKindFilter,
+    /// Solo (1 instance) vs multi-instance (>1) vs any.
+    instance: InstanceFilter,
+    /// Minimum number of distinct publishers reporting this contract;
+    /// 1 = no constraint. Useful to surface "widely-replicated" rows.
+    min_subscribers: u32,
+}
+
+impl Default for ContractFilter {
+    fn default() -> Self {
+        Self {
+            kind: ContractKindFilter::Any,
+            instance: InstanceFilter::Any,
+            min_subscribers: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ContractKindFilter {
+    Any,
+    /// `has_web_interface == Some(true)`.
+    Web,
+    /// `has_web_interface == Some(false)`.
+    Data,
+    /// `has_web_interface == None` (probe pending or unsupported).
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InstanceFilter {
+    Any,
+    /// `instance_keys.len() > 1` — same code/title across many ids.
+    Multi,
+    /// `instance_keys.len() == 1`.
+    Solo,
+}
+
+/// User-selectable sort axis for the Contracts list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum ContractSort {
+    /// Default: group by kind (webapp/unknown/data) then alpha-by-title.
+    #[default]
+    KindThenName,
+    /// Most subscribers first (most-replicated apps surface to the top).
+    SubscribersDesc,
+    /// Most instances first (templates with the largest fan-out).
+    InstancesDesc,
+    /// Most recently published first.
+    LastUpdateDesc,
+    /// Alpha by title/key.
+    NameAsc,
 }
 
 /// One sample for the header sparkline. Cheap to clone (16 bytes).
@@ -61,6 +114,18 @@ fn app() -> Html {
     let is_dragging = use_state(|| false);
     let last_copied: UseStateHandle<Option<String>> = use_state(|| None);
     let drawer_open = use_state(|| false);
+    // Contracts-tab filter facets (kind, instance count, min subs).
+    let contract_filter: UseStateHandle<ContractFilter> = use_state(ContractFilter::default);
+    // Contracts-tab sort axis.
+    let contract_sort: UseStateHandle<ContractSort> = use_state(ContractSort::default);
+    // Active "hosted by" filter — pin the list to one publisher's
+    // contracts. Stored as the publisher's gateway label (matches
+    // `seen_by` strings produced by `flat_contracts`). `None` = no
+    // filter active.
+    let publisher_filter: UseStateHandle<Option<String>> = use_state(|| None);
+    // Per-group collapse state, keyed by group label ("webapps", "data",
+    // "unknown"). Default = expanded (false) for everything.
+    let collapsed_groups: UseStateHandle<HashSet<String>> = use_state(HashSet::new);
     // Verified entries received over the topology-contract subscription.
     // Per-publisher LWW: keyed by hex pubkey, replaced when an entry's
     // `timestamp_ms` is strictly newer. This is the dashboard's *only*
@@ -316,6 +381,45 @@ fn app() -> Html {
         })
     };
 
+    let on_contract_filter_change = {
+        let contract_filter = contract_filter.clone();
+        Callback::from(move |f: ContractFilter| contract_filter.set(f))
+    };
+    let on_contract_sort_change = {
+        let contract_sort = contract_sort.clone();
+        Callback::from(move |s: ContractSort| contract_sort.set(s))
+    };
+    let on_publisher_filter_clear = {
+        let publisher_filter = publisher_filter.clone();
+        Callback::from(move |_: MouseEvent| publisher_filter.set(None))
+    };
+    // Setter form: drilldown panel calls this to "Show only this
+    // publisher's contracts". Also flips the active tab to Contracts
+    // so the user immediately sees the effect.
+    let on_publisher_filter_set = {
+        let publisher_filter = publisher_filter.clone();
+        let settings = settings.clone();
+        Callback::from(move |label: String| {
+            publisher_filter.set(Some(label));
+            let mut next = (*settings).clone();
+            if next.filter_mode != PersistedFilter::Contracts {
+                next.filter_mode = PersistedFilter::Contracts;
+                settings::save_to_storage(&next);
+                settings.set(next);
+            }
+        })
+    };
+    let on_group_toggle = {
+        let collapsed_groups = collapsed_groups.clone();
+        Callback::from(move |group_id: String| {
+            let mut next = (*collapsed_groups).clone();
+            if !next.remove(&group_id) {
+                next.insert(group_id);
+            }
+            collapsed_groups.set(next);
+        })
+    };
+
     let on_settings_update = {
         let settings = settings.clone();
         Callback::from(move |new: Settings| {
@@ -362,6 +466,14 @@ fn app() -> Html {
                             on_copy.clone(),
                             last_copied_value.as_deref(),
                             http_base.clone(),
+                            *contract_filter,
+                            on_contract_filter_change.clone(),
+                            *contract_sort,
+                            on_contract_sort_change.clone(),
+                            (*publisher_filter).clone(),
+                            on_publisher_filter_clear.clone(),
+                            (*collapsed_groups).clone(),
+                            on_group_toggle.clone(),
                         )
                     }
                 </aside>
@@ -383,6 +495,7 @@ fn app() -> Html {
                                 on_copy.clone(),
                                 last_copied_value.as_deref(),
                                 http_base.clone(),
+                                on_publisher_filter_set.clone(),
                             ),
                             None => html!{},
                         }
@@ -400,11 +513,10 @@ fn app() -> Html {
                                     but doesn't publish anything itself (sandbox + \
                                     NodeQueries gates make it impossible). Operators \
                                     contribute by running the "}
-                                    <a href="https://github.com/Basedfloppa/freenet-net-graph"
-                                       target="_blank" rel="noopener noreferrer">
-                                       <code>{"topology-publisher"}</code></a>
-                                    {" daemon alongside their freenet node — see the \
-                                    repo's "}<code>{"topology-publisher/README.md"}</code>
+                                    <code>{"topology-publisher"}</code>
+                                    {" daemon alongside their freenet node — see the "}
+                                    <a href="https://github.com/Basedfloppa/freenet-net-graph/blob/main/topology-publisher/README.md"
+                                       target="_blank" rel="noopener noreferrer">{"README"}</a>
                                     {" for a one-page setup guide."}</p>
                                 </div>
                             }
@@ -424,8 +536,8 @@ fn app() -> Html {
                     href="https://github.com/Basedfloppa/freenet-net-graph"
                     target="_blank"
                     rel="noopener noreferrer"
-                    title="Source on GitHub"
-                >{ "freenet-net-graph @ GitHub ↗" }</a>
+                    title="Source on GitHub: github.com/Basedfloppa/freenet-net-graph"
+                >{ "GitHub ↗" }</a>
             </footer>
             {
                 if *drawer_open {
@@ -492,6 +604,17 @@ fn build_topology(
             .take(8)
             .collect();
 
+        // Operator-chosen display name from `--display-name` is shipped
+        // in `EntryPayload.version`. When set, prefer it as the gateway
+        // label so users see "baka" instead of "remote: c5b03be5".
+        // Falls back to the pubkey prefix when no operator name is set.
+        // See `topology-publisher/--display-name` for the source field.
+        let display_name = p.version.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let label = match display_name {
+            Some(name) => format!("{name} ({pubkey_prefix})"),
+            None => format!("remote: {pubkey_prefix}"),
+        };
+
         let peers = p
             .neighbors
             .iter()
@@ -511,12 +634,14 @@ fn build_topology(
             .contracts
             .iter()
             .map(|raw| {
-                let (key, is_webapp, title) = decode_contract_entry(raw);
-                if is_webapp.is_some() || title.is_some() {
+                let DecodedContractEntry { key, is_webapp, title, code_hash } =
+                    decode_contract_entry(raw);
+                if is_webapp.is_some() || title.is_some() || code_hash.is_some() {
                     let slot = contract_meta.entry(key.clone()).or_insert(ContractMeta {
                         has_web_interface: false,
                         title: None,
                         probed_at: p.timestamp_ms / 1000,
+                        code_hash: None,
                     });
                     if let Some(w) = is_webapp {
                         // Any positive sighting wins — treat `false` as
@@ -528,6 +653,11 @@ fn build_topology(
                     if slot.title.is_none() {
                         if let Some(t) = title {
                             slot.title = Some(t);
+                        }
+                    }
+                    if slot.code_hash.is_none() {
+                        if let Some(c) = code_hash {
+                            slot.code_hash = Some(c);
                         }
                     }
                     let ts = p.timestamp_ms / 1000;
@@ -544,7 +674,7 @@ fn build_topology(
             .collect();
 
         gateways.push(GatewayView {
-            label: format!("remote: {pubkey_prefix}"),
+            label,
             url: format!("(contract • {})", entry.publisher_pubkey_hex),
             status: FetchStatus::Ok,
             own_location: p.own_location,
@@ -553,7 +683,11 @@ fn build_topology(
             } else {
                 Some(p.external_address.clone())
             },
-            version: p.version.clone(),
+            // `version` field is currently overloaded as the operator's
+            // display_name carrier (no real freenet-core version exposed
+            // by `NodeDiagnostics` yet). Pass `None` so the row doesn't
+            // render a misleading "vbaka" tag.
+            version: None,
             peers,
             contracts,
             last_seen_ms: Some(p.timestamp_ms),
@@ -763,13 +897,6 @@ fn flat_nodes(t: &Topology) -> Vec<FlatNode> {
 }
 
 #[derive(Clone, Debug)]
-struct ListItem {
-    kind: ItemKind,
-    node: Option<FlatNode>,
-    contract: Option<FlatContract>,
-}
-
-#[derive(Clone, Debug)]
 struct FlatContract {
     /// Canonical key — first instance encountered for this row. Used as
     /// the row's selection id and the value of the copy button.
@@ -780,33 +907,70 @@ struct FlatContract {
     last_update_ago: Option<String>,
     has_web_interface: Option<bool>,
     title: Option<String>,
+    /// Distinct page titles observed across this group. Webapps that
+    /// store their display name in state (e.g. each "Notes" instance
+    /// titled differently) report different `<title>`s for the same
+    /// underlying app — code_hash collapses those into one row, and
+    /// this list captures the variation for tooltips / search.
+    title_variants: Vec<String>,
+    /// All distinct WASM code hashes observed across the instances in
+    /// this row. Sorted + deduped. Empty when no publisher shipped a
+    /// code hash for any instance. `len() > 1` means the row collapses
+    /// multiple *versions* of the same-named app (e.g. "River v0.5"
+    /// and "River v0.6" with different WASM but identical title) —
+    /// surfaced as a "(N versions)" badge.
+    code_hashes: Vec<String>,
     /// Every distinct contract instance id collapsed into this row.
     /// Always includes `key`. `len() > 1` means several instances share
-    /// the same `<title>` (e.g. 11 "Freenet File" contracts pointing at
-    /// the same webapp template) — the row shows them as one with an
-    /// "{N} instances" badge and lets search match any of them.
+    /// the same code (or, fallback, the same `<title>`) — the row shows
+    /// them as one with an "{N} instances" badge and lets search match
+    /// any of them.
     instance_keys: Vec<String>,
+    /// Wall-clock ms when any publisher last reported one of this
+    /// row's instances. Drives the "last update" sort and powers the
+    /// recency tag in the row UI.
+    last_seen_ms: Option<u64>,
 }
 
 fn flat_contracts(t: &Topology) -> Vec<FlatContract> {
-    // First pass: dedup by raw contract key — the same key seen via
-    // multiple publishers is one contract.
+    // First pass: dedup by raw contract key — the same instance id
+    // seen via multiple publishers is one contract row to start with.
+    // We bind `last_seen_ms` from each publishing gateway here so the
+    // grouping pass can pick the freshest timestamp across instances.
     let mut by_key: HashMap<String, FlatContract> = HashMap::new();
     for gw in &t.gateways {
         for c in &gw.contracts {
             let meta = t.contract_meta.get(&c.key);
-            let entry = by_key.entry(c.key.clone()).or_insert_with(|| FlatContract {
-                key: c.key.clone(),
-                short: short_key(&c.key),
-                seen_by: Vec::new(),
-                subscribed_ago: None,
-                last_update_ago: None,
-                has_web_interface: meta.map(|m| m.has_web_interface),
-                title: meta.and_then(|m| m.title.clone()),
-                instance_keys: vec![c.key.clone()],
+            let entry = by_key.entry(c.key.clone()).or_insert_with(|| {
+                let initial_hashes = meta
+                    .and_then(|m| m.code_hash.clone())
+                    .map(|h| vec![h])
+                    .unwrap_or_default();
+                FlatContract {
+                    key: c.key.clone(),
+                    short: short_key(&c.key),
+                    seen_by: Vec::new(),
+                    subscribed_ago: None,
+                    last_update_ago: None,
+                    has_web_interface: meta.map(|m| m.has_web_interface),
+                    title: meta.and_then(|m| m.title.clone()),
+                    title_variants: meta
+                        .and_then(|m| m.title.clone())
+                        .map(|t| vec![t])
+                        .unwrap_or_default(),
+                    code_hashes: initial_hashes,
+                    instance_keys: vec![c.key.clone()],
+                    last_seen_ms: gw.last_seen_ms,
+                }
             });
             if !entry.seen_by.contains(&gw.label) {
                 entry.seen_by.push(gw.label.clone());
+            }
+            // Adopt the freshest publisher timestamp across all gateways
+            // that reported this contract — that's "last update for any
+            // instance in this group".
+            if let Some(ts) = gw.last_seen_ms {
+                entry.last_seen_ms = Some(entry.last_seen_ms.map_or(ts, |cur| cur.max(ts)));
             }
             if entry.subscribed_ago.is_none() {
                 entry.subscribed_ago = c.subscribed_ago.clone();
@@ -821,28 +985,42 @@ fn flat_contracts(t: &Topology) -> Vec<FlatContract> {
         }
     }
 
-    // Second pass: collapse rows that share a webapp `<title>`. Many
-    // webapps (e.g. "River", "Freenet File", "Freenet Field Guide")
-    // ship the same HTML template across hundreds of state instances —
-    // every parameterised instance has its own ContractInstanceId but
-    // identical `<title>`, so they look like duplicates to the user.
-    // We group by lowercased title; each group keeps its first row as
-    // canonical and accumulates the rest as `instance_keys`. Untitled
-    // contracts (data-only or unprobed) stay one-row-per-key.
+    // Second pass: collapse rows that are the same *app from the
+    // user's perspective*. Grouping key priority:
+    //   1. lowercased webapp `<title>` — title is what humans see and
+    //      compare. "River v0.5" and "River v0.6" both render as
+    //      "River" in the UI, so they're one app even though their
+    //      WASM hashes differ. Gated on `has_web_interface == Some(true)`
+    //      so unprobed-or-data entries don't all collapse into one.
+    //   2. `code_hash` — fallback for webapps with empty/no title and
+    //      for unprobed entries. Same WASM still guarantees same app.
+    //   3. raw key — singletons that have neither signal.
     //
-    // We only collapse when `has_web_interface == Some(true)` — without
-    // a confirmed webapp signal, two contracts with no title share an
-    // empty group key, which would fold all unprobed contracts into one
-    // row. The webapp gate keeps the grouping safe even before probes
-    // complete.
+    // Multiple code-hash *versions* of the same-titled app fold into
+    // one row; the resulting `code_hashes` list (deduped) drives the
+    // "(N versions)" badge in the UI so the version split stays
+    // visible. The earlier rule (code_hash first) stranded same-name
+    // apps into separate rows whenever the operator redeployed with
+    // a fresh WASM — which surfaces every time anyone publishes a new
+    // version of a popular contract like "River" or "Freenet File".
     let mut grouped: Vec<FlatContract> = Vec::new();
     let mut group_index: HashMap<String, usize> = HashMap::new();
     let mut singletons: Vec<FlatContract> = Vec::new();
 
     for entry in by_key.into_values() {
-        let group_key = match (entry.has_web_interface, entry.title.as_deref()) {
-            (Some(true), Some(t)) if !t.trim().is_empty() => Some(t.trim().to_lowercase()),
-            _ => None,
+        let group_key: Option<String> = if let (Some(true), Some(t)) =
+            (entry.has_web_interface, entry.title.as_deref())
+        {
+            let trimmed = t.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(format!("t:{}", trimmed.to_lowercase()))
+            }
+        } else if let Some(code) = entry.code_hashes.first() {
+            Some(format!("c:{code}"))
+        } else {
+            None
         };
         match group_key {
             None => singletons.push(entry),
@@ -858,10 +1036,29 @@ fn flat_contracts(t: &Topology) -> Vec<FlatContract> {
 
     let mut out: Vec<FlatContract> = grouped;
     out.append(&mut singletons);
-    // Sort: confirmed webapps first (by title when available, else key),
-    // then not-yet-probed (subscribers may still be filling the cache),
-    // then confirmed data-only contracts. Within each bucket: alphabetic
-    // on the user-visible label so the order is stable across polls.
+    // Pin each row's `key` to its *minimum* instance id for
+    // determinism. Without this, the canonical key was whichever
+    // instance the upstream `HashMap` iteration happened to land on
+    // first — different per render, so `key`-based tiebreakers below
+    // (and copy-button payloads, and selection round-trips) drifted.
+    // Same idea for `code_hashes`: stable sort makes the version
+    // badge tooltip render the hashes in the same order every time.
+    for row in out.iter_mut() {
+        row.instance_keys.sort();
+        if let Some(first) = row.instance_keys.first() {
+            row.key = first.clone();
+            row.short = short_key(first);
+        }
+        row.code_hashes.sort();
+    }
+    // Default sort: webapps → unprobed → data-only, alpha within bucket,
+    // **with `key` as the deterministic tiebreaker**. Without that final
+    // key compare, items sharing the same lowercase label (e.g. two
+    // webapps with identical `<title>` but different code hashes)
+    // resolved their order from `HashMap` iteration — which is
+    // randomised per-render, so every facet click reshuffled the list.
+    // The UI exposes a `ContractSort` selector that overrides this —
+    // see [`render_search_panel`].
     out.sort_by(|a, b| {
         let bucket = |c: &FlatContract| match c.has_web_interface {
             Some(true) => 0,
@@ -878,11 +1075,12 @@ fn flat_contracts(t: &Topology) -> Vec<FlatContract> {
         bucket(a)
             .cmp(&bucket(b))
             .then_with(|| label(a).cmp(&label(b)))
+            .then_with(|| a.key.cmp(&b.key))
     });
     out
 }
 
-/// Fold one same-title contract into an existing group row.
+/// Fold one contract into an existing group row.
 fn merge_into(dst: &mut FlatContract, src: FlatContract) {
     for k in src.instance_keys {
         if !dst.instance_keys.contains(&k) {
@@ -894,11 +1092,29 @@ fn merge_into(dst: &mut FlatContract, src: FlatContract) {
             dst.seen_by.push(label);
         }
     }
+    // Merge title variants from the incoming row; surfaces "this app
+    // has 6 instances with these distinct names" in the row tooltip.
+    for t in src.title_variants {
+        if !t.trim().is_empty() && !dst.title_variants.contains(&t) {
+            dst.title_variants.push(t);
+        }
+    }
     if dst.title.is_none() {
         dst.title = src.title;
     }
     if dst.has_web_interface != Some(true) {
         dst.has_web_interface = src.has_web_interface;
+    }
+    // Accumulate every distinct WASM code hash. Multiple hashes in
+    // one group means the same-named app got redeployed with new
+    // bytes — the "(N versions)" badge surfaces that.
+    for h in src.code_hashes {
+        if !dst.code_hashes.contains(&h) {
+            dst.code_hashes.push(h);
+        }
+    }
+    if let Some(ts) = src.last_seen_ms {
+        dst.last_seen_ms = Some(dst.last_seen_ms.map_or(ts, |cur| cur.max(ts)));
     }
 }
 
@@ -1071,6 +1287,7 @@ fn render_publisher_drilldown(
     on_copy: Callback<String>,
     last_copied: Option<&str>,
     http_base: Rc<Option<String>>,
+    on_publisher_filter_set: Callback<String>,
 ) -> Html {
     let Some(entry) = find_remote_entry_for_selection(remote, selected) else {
         return html! {};
@@ -1087,7 +1304,11 @@ fn render_publisher_drilldown(
         .own_location
         .map(|l| format!("{l:.4}"))
         .unwrap_or_else(|| "—".into());
-    let version_str = p.version.clone().unwrap_or_else(|| "—".into());
+    // `version` field carries the operator's `--display-name`. Render
+    // it under the "name" key so the drilldown reflects what the field
+    // actually holds today (real freenet-core version isn't exposed
+    // through `NodeDiagnostics` yet).
+    let display_name_str = p.version.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| "—".into());
     let address_str = if p.external_address.is_empty() {
         "—".to_string()
     } else {
@@ -1097,43 +1318,55 @@ fn render_publisher_drilldown(
     let webapp_count = p
         .contracts
         .iter()
-        .filter(|raw| {
-            let (_, w, _) = shared::contract::decode_contract_entry(raw);
-            w == Some(true)
-        })
+        .filter(|raw| shared::contract::decode_contract_entry(raw).is_webapp == Some(true))
         .count();
+
+    // Reconstruct the publisher's gateway label exactly the way
+    // `build_topology` writes it, so emitting it as a publisher-filter
+    // value matches the `seen_by` strings stored on each FlatContract.
+    let pubkey_prefix: String = entry.publisher_pubkey_hex.chars().take(8).collect();
+    let pub_filter_label = match p.version.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(name) => format!("{name} ({pubkey_prefix})"),
+        None => format!("remote: {pubkey_prefix}"),
+    };
+    let on_filter_click = {
+        let cb = on_publisher_filter_set.clone();
+        let label = pub_filter_label.clone();
+        Callback::from(move |_: MouseEvent| cb.emit(label.clone()))
+    };
 
     // Top-3 contracts by title presence (webapps with names first), with
     // a "↗ open" link for each webapp. Covers the common case of "what
     // is this node hosting?" without bloating the panel for nodes that
     // host hundreds of contracts.
-    let mut sorted_contracts: Vec<(String, Option<bool>, Option<String>)> = p
+    let mut sorted_contracts: Vec<DecodedContractEntry> = p
         .contracts
         .iter()
         .map(|raw| shared::contract::decode_contract_entry(raw))
         .collect();
     sorted_contracts.sort_by(|a, b| {
-        let bucket = |c: &(String, Option<bool>, Option<String>)| match c.1 {
+        let bucket = |c: &DecodedContractEntry| match c.is_webapp {
             Some(true) => 0,
             None => 1,
             Some(false) => 2,
         };
         bucket(a)
             .cmp(&bucket(b))
-            .then_with(|| a.2.as_deref().unwrap_or("").cmp(b.2.as_deref().unwrap_or("")))
+            .then_with(|| a.title.as_deref().unwrap_or("").cmp(b.title.as_deref().unwrap_or("")))
     });
     let preview: Vec<Html> = sorted_contracts
         .iter()
         .take(8)
-        .map(|(key, w, title)| {
-            let label = title
+        .map(|d| {
+            let key = &d.key;
+            let label = d.title
                 .clone()
                 .filter(|t| !t.is_empty())
                 .unwrap_or_else(|| {
                     let short: String = key.chars().take(12).collect();
                     format!("{short}…")
                 });
-            let badge = match w {
+            let badge = match d.is_webapp {
                 Some(true) => html! { <span class="web-badge web-yes">{"✓"}</span> },
                 Some(false) => html! { <span class="web-badge web-no">{"d"}</span> },
                 None => html! {},
@@ -1144,7 +1377,7 @@ fn render_publisher_drilldown(
             // → "Open in new tab") without us implementing each one in
             // JS. `stop_propagation` keeps a stray click off the link
             // itself from bubbling up to the row's selection handler.
-            let open_btn = match (*w, http_base.as_ref()) {
+            let open_btn = match (d.is_webapp, http_base.as_ref()) {
                 (Some(true), Some(base)) => {
                     let url = format!("{base}/v1/contract/web/{key}/");
                     let stop = Callback::from(|e: MouseEvent| e.stop_propagation());
@@ -1193,8 +1426,8 @@ fn render_publisher_drilldown(
             <div class="drilldown-row">
                 <span class="drilldown-key">{"location"}</span>
                 <span class="drilldown-val">{ location_str }</span>
-                <span class="drilldown-key">{"version"}</span>
-                <span class="drilldown-val">{ version_str }</span>
+                <span class="drilldown-key">{"name"}</span>
+                <span class="drilldown-val">{ display_name_str }</span>
             </div>
             <div class="drilldown-row">
                 <span class="drilldown-key">{"peers"}</span>
@@ -1221,6 +1454,13 @@ fn render_publisher_drilldown(
                     }
                 }
             }
+            // Bridge between graph selection and the Contracts list:
+            // emits the gateway label that `flat_contracts` uses in
+            // each row's `seen_by`, so the filter matches exactly.
+            <button class="drilldown-action" onclick={on_filter_click}
+                    title="filter the Contracts tab to only this publisher's hosted contracts">
+                {"🔍 Filter contracts by this publisher"}
+            </button>
         </div>
     }
 }
@@ -1273,35 +1513,19 @@ fn render_search_panel(
     on_copy: Callback<String>,
     last_copied: Option<&str>,
     http_base: Rc<Option<String>>,
+    contract_filter: ContractFilter,
+    on_contract_filter_change: Callback<ContractFilter>,
+    contract_sort: ContractSort,
+    on_contract_sort_change: Callback<ContractSort>,
+    publisher_filter: Option<String>,
+    on_publisher_filter_clear: Callback<MouseEvent>,
+    collapsed_groups: HashSet<String>,
+    on_group_toggle: Callback<String>,
 ) -> Html {
     let nodes = flat_nodes(t);
     let contracts = flat_contracts(t);
 
     let q = query.trim().to_lowercase();
-    let mut items: Vec<ListItem> = Vec::new();
-
-    match filter {
-        PersistedFilter::Nodes => {
-            for n in nodes {
-                if !q.is_empty()
-                    && !(n.id.to_lowercase().contains(&q)
-                        || n.label.to_lowercase().contains(&q)
-                        || n.seen_by.iter().any(|s| s.to_lowercase().contains(&q)))
-                { continue; }
-                items.push(ListItem { kind: ItemKind::Node, node: Some(n), contract: None });
-            }
-        }
-        PersistedFilter::Contracts => {
-            for c in contracts {
-                if !q.is_empty()
-                    && !(c.instance_keys.iter().any(|k| k.to_lowercase().contains(&q))
-                        || c.seen_by.iter().any(|s| s.to_lowercase().contains(&q))
-                        || c.title.as_deref().map(|t| t.to_lowercase().contains(&q)).unwrap_or(false))
-                { continue; }
-                items.push(ListItem { kind: ItemKind::Contract, node: None, contract: Some(c) });
-            }
-        }
-    }
 
     let header_text = match filter {
         PersistedFilter::Nodes => "Nodes",
@@ -1339,12 +1563,67 @@ fn render_search_panel(
                     } else { html!{} }
                 }
             </div>
+            {
+                match filter {
+                    PersistedFilter::Nodes => render_nodes_list(
+                        nodes, &q, selected, on_pick.clone(), on_copy.clone(), last_copied,
+                    ),
+                    PersistedFilter::Contracts => render_contracts_list(
+                        contracts,
+                        &q,
+                        selected,
+                        on_pick.clone(),
+                        on_copy.clone(),
+                        last_copied,
+                        http_base.clone(),
+                        contract_filter,
+                        on_contract_filter_change.clone(),
+                        contract_sort,
+                        on_contract_sort_change.clone(),
+                        publisher_filter,
+                        on_publisher_filter_clear,
+                        collapsed_groups,
+                        on_group_toggle,
+                    ),
+                }
+            }
+        </>
+    }
+}
+
+fn render_nodes_list(
+    nodes: Vec<FlatNode>,
+    q: &str,
+    selected: Option<&str>,
+    on_pick: Callback<String>,
+    on_copy: Callback<String>,
+    last_copied: Option<&str>,
+) -> Html {
+    let mut filtered: Vec<FlatNode> = Vec::new();
+    let total = nodes.len();
+    for n in nodes {
+        if !q.is_empty()
+            && !(n.id.to_lowercase().contains(q)
+                || n.label.to_lowercase().contains(q)
+                || n.seen_by.iter().any(|s| s.to_lowercase().contains(q)))
+        {
+            continue;
+        }
+        filtered.push(n);
+    }
+    html! {
+        <>
+            <div class="result-count">
+                { format!("{} of {}", filtered.len(), total) }
+            </div>
             <div class="node-list">
                 {
-                    if items.is_empty() {
+                    if filtered.is_empty() {
                         html! { <p class="empty">{"no matches"}</p> }
                     } else {
-                        items.iter().map(|it| render_list_row(it, selected, on_pick.clone(), on_copy.clone(), last_copied, http_base.clone())).collect::<Html>()
+                        filtered.iter().map(|n| {
+                            render_node_row(n, selected, on_pick.clone(), on_copy.clone(), last_copied, q)
+                        }).collect::<Html>()
                     }
                 }
             </div>
@@ -1352,18 +1631,351 @@ fn render_search_panel(
     }
 }
 
-fn render_list_row(
-    item: &ListItem,
+#[allow(clippy::too_many_arguments)]
+fn render_contracts_list(
+    contracts: Vec<FlatContract>,
+    q: &str,
     selected: Option<&str>,
     on_pick: Callback<String>,
     on_copy: Callback<String>,
     last_copied: Option<&str>,
     http_base: Rc<Option<String>>,
+    filter: ContractFilter,
+    on_filter_change: Callback<ContractFilter>,
+    sort: ContractSort,
+    on_sort_change: Callback<ContractSort>,
+    publisher_filter: Option<String>,
+    on_publisher_filter_clear: Callback<MouseEvent>,
+    collapsed_groups: HashSet<String>,
+    on_group_toggle: Callback<String>,
 ) -> Html {
-    match item.kind {
-        ItemKind::Node => render_node_row(item.node.as_ref().unwrap(), selected, on_pick, on_copy, last_copied),
-        ItemKind::Contract => render_contract_row(item.contract.as_ref().unwrap(), selected, on_pick, on_copy, last_copied, http_base),
+    let total = contracts.len();
+    // Apply text query + facet filters + publisher filter in one pass.
+    let mut filtered: Vec<FlatContract> = contracts
+        .into_iter()
+        .filter(|c| {
+            // Text query: match against title, all instance keys, all
+            // publishers, and code_hash so a partial hash works too.
+            if !q.is_empty() {
+                let in_keys = c.instance_keys.iter().any(|k| k.to_lowercase().contains(q));
+                let in_pubs = c.seen_by.iter().any(|s| s.to_lowercase().contains(q));
+                let in_title = c
+                    .title
+                    .as_deref()
+                    .map(|t| t.to_lowercase().contains(q))
+                    .unwrap_or(false)
+                    || c.title_variants.iter().any(|t| t.to_lowercase().contains(q));
+                let in_hash = c.code_hashes.iter().any(|h| h.to_lowercase().contains(q));
+                if !(in_keys || in_pubs || in_title || in_hash) {
+                    return false;
+                }
+            }
+            // Kind facet.
+            match (filter.kind, c.has_web_interface) {
+                (ContractKindFilter::Any, _) => {}
+                (ContractKindFilter::Web, Some(true)) => {}
+                (ContractKindFilter::Data, Some(false)) => {}
+                (ContractKindFilter::Unknown, None) => {}
+                _ => return false,
+            }
+            // Instance count facet.
+            match filter.instance {
+                InstanceFilter::Any => {}
+                InstanceFilter::Multi if c.instance_keys.len() > 1 => {}
+                InstanceFilter::Solo if c.instance_keys.len() == 1 => {}
+                _ => return false,
+            }
+            // Min subscribers facet.
+            if (c.seen_by.len() as u32) < filter.min_subscribers {
+                return false;
+            }
+            // Publisher filter (if active): must include this publisher.
+            if let Some(p) = publisher_filter.as_deref() {
+                if !c.seen_by.iter().any(|s| s == p) {
+                    return false;
+                }
+            }
+            true
+        })
+        .collect();
+
+    // Apply user-selected sort. `KindThenName` keeps the existing
+    // bucketed order from `flat_contracts` — fall through with a stable
+    // identity sort so we don't undo it.
+    sort_contracts(&mut filtered, sort);
+
+    let visible = filtered.len();
+
+    html! {
+        <>
+            { render_facet_chips(filter, on_filter_change.clone()) }
+            { render_sort_dropdown(sort, on_sort_change) }
+            {
+                if let Some(p) = publisher_filter.as_deref() {
+                    html! {
+                        <div class="active-filter">
+                            <span>{"hosted by "}<b>{ p.to_string() }</b></span>
+                            <button class="active-filter-clear"
+                                    onclick={on_publisher_filter_clear}
+                                    title="clear publisher filter">{"✕"}</button>
+                        </div>
+                    }
+                } else { html! {} }
+            }
+            <div class="result-count">
+                { format!("{visible} of {total}") }
+                {
+                    if filter != ContractFilter::default() || sort != ContractSort::default() || publisher_filter.is_some() {
+                        html! { <span class="result-count-modifier">{" • filtered"}</span> }
+                    } else { html! {} }
+                }
+            </div>
+            { render_grouped_contracts(filtered, selected, on_pick, on_copy, last_copied, http_base, sort, &collapsed_groups, on_group_toggle, q) }
+        </>
     }
+}
+
+fn sort_contracts(items: &mut [FlatContract], sort: ContractSort) {
+    // Every branch ends with `then_with(|| a.key.cmp(&b.key))` — the
+    // canonical instance id is unique per row and breaks every tie
+    // deterministically. Without it, two rows with identical visible
+    // values (same title or same subscriber count) flipped order
+    // between renders because `flat_contracts` iterates a `HashMap`,
+    // whose iteration order is randomised per session.
+    match sort {
+        ContractSort::KindThenName => { /* `flat_contracts` already does this */ }
+        ContractSort::SubscribersDesc => {
+            items.sort_by(|a, b| {
+                b.seen_by.len().cmp(&a.seen_by.len()).then_with(|| {
+                    let la = a.title.as_deref().unwrap_or(&a.key).to_lowercase();
+                    let lb = b.title.as_deref().unwrap_or(&b.key).to_lowercase();
+                    la.cmp(&lb)
+                }).then_with(|| a.key.cmp(&b.key))
+            });
+        }
+        ContractSort::InstancesDesc => {
+            items.sort_by(|a, b| {
+                b.instance_keys.len().cmp(&a.instance_keys.len()).then_with(|| {
+                    let la = a.title.as_deref().unwrap_or(&a.key).to_lowercase();
+                    let lb = b.title.as_deref().unwrap_or(&b.key).to_lowercase();
+                    la.cmp(&lb)
+                }).then_with(|| a.key.cmp(&b.key))
+            });
+        }
+        ContractSort::LastUpdateDesc => {
+            items.sort_by(|a, b| {
+                b.last_seen_ms
+                    .unwrap_or(0)
+                    .cmp(&a.last_seen_ms.unwrap_or(0))
+                    .then_with(|| a.key.cmp(&b.key))
+            });
+        }
+        ContractSort::NameAsc => {
+            items.sort_by(|a, b| {
+                let la = a.title.as_deref().unwrap_or(&a.key).to_lowercase();
+                let lb = b.title.as_deref().unwrap_or(&b.key).to_lowercase();
+                la.cmp(&lb).then_with(|| a.key.cmp(&b.key))
+            });
+        }
+    }
+}
+
+fn render_facet_chips(filter: ContractFilter, on_change: Callback<ContractFilter>) -> Html {
+    let chip = |label: &'static str, active: bool, next_filter: ContractFilter| -> Html {
+        let cb = on_change.clone();
+        let onclick = Callback::from(move |_: MouseEvent| cb.emit(next_filter));
+        let class = classes!("facet-chip", active.then_some("active"));
+        html! { <button class={class} onclick={onclick}>{ label }</button> }
+    };
+    let mut without_kind = filter; without_kind.kind = ContractKindFilter::Any;
+    let mut to_web = filter; to_web.kind = ContractKindFilter::Web;
+    let mut to_data = filter; to_data.kind = ContractKindFilter::Data;
+    let mut to_unknown = filter; to_unknown.kind = ContractKindFilter::Unknown;
+
+    let mut without_inst = filter; without_inst.instance = InstanceFilter::Any;
+    let mut to_multi = filter; to_multi.instance = InstanceFilter::Multi;
+    let mut to_solo = filter; to_solo.instance = InstanceFilter::Solo;
+
+    let mut min1 = filter; min1.min_subscribers = 1;
+    let mut min2 = filter; min2.min_subscribers = 2;
+    let mut min3 = filter; min3.min_subscribers = 3;
+
+    html! {
+        <div class="facet-rows">
+            <div class="facet-row">
+                <span class="facet-label">{"kind"}</span>
+                { chip("any",  filter.kind == ContractKindFilter::Any,     without_kind) }
+                { chip("web",  filter.kind == ContractKindFilter::Web,     to_web) }
+                { chip("data", filter.kind == ContractKindFilter::Data,    to_data) }
+                { chip("?",    filter.kind == ContractKindFilter::Unknown, to_unknown) }
+            </div>
+            <div class="facet-row">
+                <span class="facet-label">{"count"}</span>
+                { chip("any",   filter.instance == InstanceFilter::Any,   without_inst) }
+                { chip("multi", filter.instance == InstanceFilter::Multi, to_multi) }
+                { chip("solo",  filter.instance == InstanceFilter::Solo,  to_solo) }
+            </div>
+            <div class="facet-row">
+                <span class="facet-label">{"≥subs"}</span>
+                { chip("1",  filter.min_subscribers <= 1, min1) }
+                { chip("2+", filter.min_subscribers == 2, min2) }
+                { chip("3+", filter.min_subscribers >= 3, min3) }
+            </div>
+        </div>
+    }
+}
+
+fn render_sort_dropdown(sort: ContractSort, on_change: Callback<ContractSort>) -> Html {
+    let onchange = Callback::from(move |e: web_sys::Event| {
+        let target: web_sys::HtmlSelectElement = e.target_unchecked_into();
+        let next = match target.value().as_str() {
+            "subs" => ContractSort::SubscribersDesc,
+            "instances" => ContractSort::InstancesDesc,
+            "recent" => ContractSort::LastUpdateDesc,
+            "name" => ContractSort::NameAsc,
+            _ => ContractSort::KindThenName,
+        };
+        on_change.emit(next);
+    });
+    let val = match sort {
+        ContractSort::KindThenName => "default",
+        ContractSort::SubscribersDesc => "subs",
+        ContractSort::InstancesDesc => "instances",
+        ContractSort::LastUpdateDesc => "recent",
+        ContractSort::NameAsc => "name",
+    };
+    html! {
+        <div class="sort-row">
+            <label class="sort-label">{"sort"}</label>
+            <select class="sort-select" value={val} onchange={onchange}>
+                <option value="default"   selected={sort == ContractSort::KindThenName}>{"default (kind → name)"}</option>
+                <option value="subs"      selected={sort == ContractSort::SubscribersDesc}>{"subscribers ↓"}</option>
+                <option value="instances" selected={sort == ContractSort::InstancesDesc}>{"instances ↓"}</option>
+                <option value="recent"    selected={sort == ContractSort::LastUpdateDesc}>{"last update ↓"}</option>
+                <option value="name"      selected={sort == ContractSort::NameAsc}>{"name ↑"}</option>
+            </select>
+        </div>
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_grouped_contracts(
+    items: Vec<FlatContract>,
+    selected: Option<&str>,
+    on_pick: Callback<String>,
+    on_copy: Callback<String>,
+    last_copied: Option<&str>,
+    http_base: Rc<Option<String>>,
+    sort: ContractSort,
+    collapsed: &HashSet<String>,
+    on_toggle: Callback<String>,
+    query: &str,
+) -> Html {
+    if items.is_empty() {
+        return html! { <div class="node-list"><p class="empty">{"no matches"}</p></div> };
+    }
+    // For non-default sort axes we don't section the list — the whole
+    // point of "subscribers ↓" or "last update ↓" is one continuous
+    // ranking. Default sort keeps the kind-bucketed grouping so users
+    // can collapse "data only" when it dominates.
+    if sort != ContractSort::KindThenName {
+        return html! {
+            <div class="node-list">
+                {
+                    items.iter().map(|c| {
+                        render_contract_row(c, selected, on_pick.clone(), on_copy.clone(), last_copied, http_base.clone(), query)
+                    }).collect::<Html>()
+                }
+            </div>
+        };
+    }
+    let mut webs: Vec<FlatContract> = Vec::new();
+    let mut unknowns: Vec<FlatContract> = Vec::new();
+    let mut datas: Vec<FlatContract> = Vec::new();
+    for c in items {
+        match c.has_web_interface {
+            Some(true) => webs.push(c),
+            None => unknowns.push(c),
+            Some(false) => datas.push(c),
+        }
+    }
+    let group = |id: &'static str, label: &'static str, rows: Vec<FlatContract>| -> Html {
+        if rows.is_empty() {
+            return html! {};
+        }
+        let count = rows.len();
+        let is_collapsed = collapsed.contains(id);
+        let cb = on_toggle.clone();
+        let id_owned = id.to_string();
+        let onclick = Callback::from(move |_: MouseEvent| cb.emit(id_owned.clone()));
+        let chevron = if is_collapsed { "▶" } else { "▼" };
+        html! {
+            <div class="contract-group">
+                <button class="contract-group-header" onclick={onclick}>
+                    <span class="contract-group-chevron">{ chevron }</span>
+                    <span class="contract-group-label">{ label }</span>
+                    <span class="contract-group-count">{ format!("({count})") }</span>
+                </button>
+                {
+                    if is_collapsed {
+                        html! {}
+                    } else {
+                        html! {
+                            <div class="node-list">
+                                {
+                                    rows.iter().map(|c| {
+                                        render_contract_row(c, selected, on_pick.clone(), on_copy.clone(), last_copied, http_base.clone(), query)
+                                    }).collect::<Html>()
+                                }
+                            </div>
+                        }
+                    }
+                }
+            </div>
+        }
+    };
+    html! {
+        <div class="contract-groups">
+            { group("webapps", "Webapps",      webs) }
+            { group("unknown", "Unprobed",     unknowns) }
+            { group("data",    "Data only",    datas) }
+        </div>
+    }
+}
+
+/// Wrap every occurrence of `q` (case-insensitive) inside `text` with
+/// `<mark class="hl">` so the user sees *why* a row matched. Returns
+/// the original text wrapped in a single fragment when `q` is empty.
+/// The match is byte-position-based (works on multi-byte UTF-8 too).
+fn highlight(text: &str, q: &str) -> Html {
+    if q.is_empty() {
+        return html! { <>{ text.to_string() }</> };
+    }
+    let lower = text.to_lowercase();
+    let q_lower = q.to_lowercase();
+    if !lower.contains(&q_lower) {
+        return html! { <>{ text.to_string() }</> };
+    }
+    let mut out: Vec<Html> = Vec::new();
+    let mut i = 0;
+    while i < text.len() {
+        match lower[i..].find(&q_lower) {
+            Some(rel) => {
+                let abs = i + rel;
+                if abs > i {
+                    out.push(html! { <>{ text[i..abs].to_string() }</> });
+                }
+                let end = abs + q_lower.len();
+                out.push(html! { <mark class="hl">{ text[abs..end].to_string() }</mark> });
+                i = end;
+            }
+            None => {
+                out.push(html! { <>{ text[i..].to_string() }</> });
+                break;
+            }
+        }
+    }
+    html! { <>{ for out }</> }
 }
 
 fn copy_button(value_to_copy: String, on_copy: Callback<String>, last_copied: Option<&str>) -> Html {
@@ -1388,6 +2000,7 @@ fn render_node_row(
     on_pick: Callback<String>,
     on_copy: Callback<String>,
     last_copied: Option<&str>,
+    query: &str,
 ) -> Html {
     let kind_class = if n.is_public_default { "kind-public" } else if n.is_gateway { "kind-gw" } else { "kind-peer" };
     let kind_text = if n.is_public_default { "public" } else if n.is_gateway { "gateway" } else { "peer" };
@@ -1432,11 +2045,11 @@ fn render_node_row(
                             html! { <span class={classes!("status-dot", c)} title={status_tooltip.clone()}></span> }
                         } else { html!{} }
                     }
-                    <span class="row-label">{ label_main }</span>
+                    <span class="row-label">{ highlight(label_main, query) }</span>
                     { if let Some(v) = &n.version { html! { <span class="row-tag">{ format!("v{v}") }</span> } } else { html!{} } }
                     { if is_stale { html! { <span class="row-tag row-tag-stale" title="no fresh entry in >5 min">{"stale"}</span> } } else { html!{} } }
                 </div>
-                { if let Some(addr) = secondary { html! { <div class="row-sub">{ addr }</div> } } else { html!{} } }
+                { if let Some(addr) = secondary { html! { <div class="row-sub">{ highlight(addr, query) }</div> } } else { html!{} } }
                 <div class="row-sub">
                     <span>{ loc_str }</span>
                     { if let Some(pc) = n.peer_count { html! { <span>{" • "}{ format!("{pc} peer(s)") }</span> } } else { html!{} } }
@@ -1457,6 +2070,7 @@ fn render_contract_row(
     on_copy: Callback<String>,
     last_copied: Option<&str>,
     http_base: Rc<Option<String>>,
+    query: &str,
 ) -> Html {
     let is_selected = selected == Some(c.key.as_str());
     let row_class = classes!("node-row", is_selected.then_some("selected"));
@@ -1506,14 +2120,62 @@ fn render_contract_row(
     } else {
         c.key.clone()
     };
+    let main_label_clone = main_label.clone();
+    let key_line_clone = key_line.clone();
+    // Code-hash badge. One hash → show its 6-char prefix.
+    // Multiple hashes (same-named app, different WASM) →
+    // "⬢ N versions" with a tooltip listing every distinct hash.
+    let code_badge: Option<Html> = match c.code_hashes.as_slice() {
+        [] => None,
+        [h] => {
+            let short: String = h.chars().take(6).collect();
+            Some(html! {
+                <span class="code-hash-badge" title={format!("code hash: {h}")}>
+                    { format!("⬢ {short}") }
+                </span>
+            })
+        }
+        many => {
+            let n = many.len();
+            let tooltip = format!(
+                "{n} distinct code hashes — same-named app, different WASM bytes:\n• {}",
+                many.join("\n• ")
+            );
+            Some(html! {
+                <span class="code-hash-badge code-hash-badge-multi" title={tooltip}>
+                    { format!("⬢ {n} versions") }
+                </span>
+            })
+        }
+    };
+    // If different titles were observed for the same app (typical
+    // when state is included in `<title>`), expose a tooltip showing
+    // the variants. Useful for the now-rare case where code_hash
+    // grouping merges instances that show different UI names.
+    let variants_tooltip = if c.title_variants.len() > 1 {
+        Some(format!(
+            "{} title variants observed:\n• {}",
+            c.title_variants.len(),
+            c.title_variants.join("\n• ")
+        ))
+    } else {
+        None
+    };
     html! {
         <div class={row_class} onclick={onclick} onauxclick={onauxclick}>
             <span class="hue-dot" style="background: #14b8a6;"></span>
             <div class="row-text">
                 <div class="row-main">
                     <span class={classes!("kind-tag", "kind-contract")}>{"contract"}</span>
-                    <span class="row-label">{ main_label }</span>
+                    {
+                        if let Some(t) = variants_tooltip.as_ref() {
+                            html! { <span class="row-label" title={t.clone()}>{ highlight(&main_label_clone, query) }</span> }
+                        } else {
+                            html! { <span class="row-label">{ highlight(&main_label_clone, query) }</span> }
+                        }
+                    }
                     { if let Some((cls, text)) = web_badge { html! { <span class={classes!(cls)}>{ text }</span> } } else { html!{} } }
+                    { if let Some(b) = code_badge { b } else { html!{} } }
                     {
                         if instance_count > 1 {
                             html! { <span class="row-tag">{ format!("{instance_count} instances") }</span> }
@@ -1521,11 +2183,11 @@ fn render_contract_row(
                     }
                     <span class="row-tag">{ format!("{} subs", c.seen_by.len()) }</span>
                 </div>
-                <div class="row-sub">{ key_line }</div>
+                <div class="row-sub">{ highlight(&key_line_clone, query) }</div>
                 <div class="row-sub">
                     { if let Some(s) = &c.subscribed_ago { html! { <span>{"subscribed "}{ s }</span> } } else { html!{} } }
                     { if let Some(u) = &c.last_update_ago { html! { <span>{" • last update "}{ u }</span> } } else { html!{} } }
-                    { if !seen.is_empty() { html! { <span>{" • "}{ seen }</span> } } else { html!{} } }
+                    { if !seen.is_empty() { html! { <span>{" • "}{ highlight(&seen, query) }</span> } } else { html!{} } }
                 </div>
             </div>
             {
@@ -1645,80 +2307,15 @@ fn settings_drawer(props: &SettingsDrawerProps) -> Html {
                 <section class="settings-group">
                 <h3>{"🌐 Data sources"}</h3>
                 <p class="hint">
-                    {"Two streams populate this graph:"}
+                    {"All graph content comes from operator-run "}
+                    <code>{"topology-publisher"}</code>
+                    {" daemons that subscribe to the same Freenet topology \
+                    contract (see "}<code>{"Network sharing"}</code>{" below). \
+                    Each publisher signs its own snapshot with an Ed25519 key, \
+                    so labels and peer lists are operator-controlled — no \
+                    visitor of this dashboard can rename a node or fake a \
+                    publisher entry."}
                 </p>
-                <ul class="hint">
-                    <li>{"Live subscription to a topology contract (see "}
-                        <code>{"Network sharing"}</code>{"). Operator-side \
-                        "}<code>{"topology-publisher"}</code>{" daemons write \
-                        entries; this dashboard reads them."}</li>
-                    <li>{"Your own "}<code>{"Known public nodes"}</code>
-                        {" list (below). Anchors that appear in the graph \
-                        regardless of whether any daemon has reported them \
-                        — handy for showing operator-known gateways before \
-                        anyone publishes."}</li>
-                </ul>
-                <h4>{"Known public nodes"}</h4>
-                <p class="hint">{"Each row is one peer. "}
-                <code>{"address"}</code>{" is the network-side UDP endpoint \
-                (e.g. "}<code>{"78.27.236.159:31337"}</code>{") — same format \
-                a freenet-core node uses to dial a peer. "}
-                <code>{"location"}</code>{" is the optional ring location \
-                (0..1) you've observed for that peer."}</p>
-                {
-                    s.known_nodes.iter().enumerate().map(|(idx, kn)| {
-                        let on_label = {
-                            let mutate = mutate.clone();
-                            Callback::from(move |e: InputEvent| {
-                                let v: String = e.target_unchecked_into::<web_sys::HtmlInputElement>().value();
-                                mutate(&|s| if let Some(k) = s.known_nodes.get_mut(idx) { k.label = v.clone(); });
-                            })
-                        };
-                        let on_addr = {
-                            let mutate = mutate.clone();
-                            Callback::from(move |e: InputEvent| {
-                                let v: String = e.target_unchecked_into::<web_sys::HtmlInputElement>().value();
-                                mutate(&|s| if let Some(k) = s.known_nodes.get_mut(idx) { k.address = v.clone(); });
-                            })
-                        };
-                        let on_loc = {
-                            let mutate = mutate.clone();
-                            Callback::from(move |e: InputEvent| {
-                                let v: String = e.target_unchecked_into::<web_sys::HtmlInputElement>().value();
-                                let parsed = v.trim().parse::<f64>().ok().filter(|x| (0.0..1.0).contains(x));
-                                mutate(&|s| if let Some(k) = s.known_nodes.get_mut(idx) { k.location = parsed; });
-                            })
-                        };
-                        let on_remove = {
-                            let mutate = mutate.clone();
-                            Callback::from(move |_: MouseEvent| {
-                                mutate(&|s| { if idx < s.known_nodes.len() { s.known_nodes.remove(idx); } });
-                            })
-                        };
-                        let loc_str = kn.location.map(|l| format!("{l:.4}")).unwrap_or_default();
-                        html! {
-                            <div class="gw-row" key={idx}>
-                                <input class="gw-label" type="text" placeholder="label" value={kn.label.clone()} oninput={on_label} />
-                                <input class="gw-url"   type="text" placeholder="host:port" value={kn.address.clone()} oninput={on_addr} />
-                                <input class="gw-loc"   type="text" placeholder="loc" value={loc_str} oninput={on_loc} />
-                                <button class="gw-remove" onclick={on_remove}>{"✕"}</button>
-                            </div>
-                        }
-                    }).collect::<Html>()
-                }
-                <button class="add-row" onclick={
-                    let mutate = mutate.clone();
-                    Callback::from(move |_: MouseEvent| {
-                        mutate(&|s| s.known_nodes.push(KnownNode {
-                            label: "new".to_string(),
-                            address: "host:31337".to_string(),
-                            location: None,
-                            is_gateway: true,
-                            source: "cli".to_string(),
-                        }));
-                    })
-                }>{"+ add known node"}</button>
-
                 </section>
 
                 <section class="settings-group">
@@ -1808,24 +2405,36 @@ fn settings_drawer(props: &SettingsDrawerProps) -> Html {
                         layout_field("repulsion min dist (px)", 2.0, 60.0, 1.0, s.layout.repel_min_dist,
                             std::rc::Rc::new(|l: &mut LayoutSettings, v| l.repel_min_dist = v))
                     }
-                    {
-                        layout_field("soft clamp radius (px)", 200.0, 600.0, 5.0, s.layout.soft_clamp_radius,
-                            std::rc::Rc::new(|l: &mut LayoutSettings, v| l.soft_clamp_radius = v))
-                    }
                 </details>
                 </section>
 
                 <section class="settings-group">
                 <h3>{"🔗 Network sharing"}</h3>
                 <p class="hint">
-                    {"Subscribe to a Freenet topology contract on your local node. \
-                    The dashboard receives every signed "}<code>{"EntryPayload"}</code>
-                    {" the operator-side daemon pushes into that contract; entries \
-                    are verified against their embedded Ed25519 key before \
-                    merging. The dashboard itself does "}<em>{"not"}</em>
-                    {" publish — only the "}<code>{"topology-publisher"}</code>
-                    {" daemon does. To contribute, run the daemon next to your \
-                    own freenet node."}
+                    {"This dashboard subscribes to a Freenet topology contract \
+                    on your local node and renders every signed "}
+                    <code>{"EntryPayload"}</code>{" it receives. Entries are \
+                    verified against their embedded Ed25519 key before merging \
+                    — bad signatures are dropped silently."}
+                </p>
+                <p class="hint">
+                    {"The dashboard itself does "}<em>{"not"}</em>{" publish: \
+                    the sandboxed iframe can't query the local node's real \
+                    peer list (CORS + "}<code>{"NodeQueries"}</code>{" gating). \
+                    Real data comes from "}<code>{"topology-publisher"}</code>
+                    {", a small daemon that runs alongside your freenet node \
+                    and pushes a signed snapshot every 60 s."}
+                </p>
+                <p class="hint">
+                    {"📦 To contribute your node's view to the graph, set up \
+                    the daemon — see the "}
+                    <a href="https://github.com/Basedfloppa/freenet-net-graph/blob/main/topology-publisher/README.md"
+                       target="_blank" rel="noopener noreferrer">{"README"}</a>
+                    {" for a one-page guide (build, key file, systemd unit, "}
+                    <code>{"/healthz"}</code>{" + "}<code>{"/metrics"}</code>
+                    {"). Source on "}
+                    <a href="https://github.com/Basedfloppa/freenet-net-graph"
+                       target="_blank" rel="noopener noreferrer">{"GitHub"}</a>{"."}
                 </p>
                 <div class="setting-row">
                     <label>{"enabled"}</label>
@@ -1839,34 +2448,6 @@ fn settings_drawer(props: &SettingsDrawerProps) -> Html {
                     <span class={classes!("contract-status", contract_status_class(&props.contract_status))}>
                         { contract_status_label(&props.contract_status) }
                     </span>
-                </div>
-                <div class="setting-row">
-                    <label>{"node WS URL"}</label>
-                    <input type="text" placeholder="ws://localhost:7509"
-                        value={s.contract.node_ws_url.clone()}
-                        oninput={
-                            let mutate = mutate.clone();
-                            Callback::from(move |e: InputEvent| {
-                                let v: String = e.target_unchecked_into::<web_sys::HtmlInputElement>().value();
-                                mutate(&|s| s.contract.node_ws_url = v.clone());
-                            })
-                        }
-                    />
-                    <span></span>
-                </div>
-                <div class="setting-row">
-                    <label>{"contract instance id"}</label>
-                    <input type="text" placeholder="base58 ContractInstanceId"
-                        value={s.contract.instance_id.clone()}
-                        oninput={
-                            let mutate = mutate.clone();
-                            Callback::from(move |e: InputEvent| {
-                                let v: String = e.target_unchecked_into::<web_sys::HtmlInputElement>().value();
-                                mutate(&|s| s.contract.instance_id = v.clone());
-                            })
-                        }
-                    />
-                    <span></span>
                 </div>
                 <p class="hint">
                     { format!("{} publisher(s) seen in this session.", props.remote_entry_count) }

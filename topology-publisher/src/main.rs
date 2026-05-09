@@ -91,11 +91,22 @@ struct Cli {
     #[arg(long)]
     key_file: Option<PathBuf>,
 
-    /// Optional friendly label included in `EntryPayload.version` so
-    /// subscribers can tell publishers apart at a glance. The contract
-    /// still keys on the Ed25519 pubkey; this is purely cosmetic.
-    #[arg(long)]
-    label: Option<String>,
+    /// Operator-chosen public display name (e.g. "baka", "orange").
+    /// Shipped in `EntryPayload.version` so the dashboard can label this
+    /// publisher's gateway with a human-readable string instead of a
+    /// pubkey prefix. Purely cosmetic — the contract still identifies
+    /// publishers by their Ed25519 pubkey.
+    ///
+    /// IMPORTANT: this is *public*. Don't pass `$(hostname)` or any
+    /// other auto-detected machine identifier — that leaks server
+    /// metadata to every dashboard visitor. Pick a friendly nickname
+    /// you're comfortable showing to anyone on the network.
+    ///
+    /// `--label` is the deprecated alias retained for back-compat with
+    /// existing systemd units; new deployments should use
+    /// `--display-name`.
+    #[arg(long, alias = "label")]
+    display_name: Option<String>,
 
     /// Fallback `neighbors` entries (`label,host:port` or just
     /// `host:port`) to publish when `NodeDiagnostics` is unavailable
@@ -261,25 +272,32 @@ fn build_payload(
     //      attached over WS); useful as a last-resort enumeration.
     // Subscribers display whatever shows up here — no `bincode`
     // breaking change required.
-    let mut keys: Vec<String> = Vec::new();
+    // `(instance_id, Option<code_hash_base58>)`. Code hash is the
+    // grouping key subscribers use to recognise "same app, different
+    // instance" — see [`shared::contract::encode_contract_entry`] for
+    // the wire suffix. Only `contract_states` carries `ContractKey`
+    // (which has both fields); the other two sources are instance-only,
+    // so their code-hash slot is `None` (subscribers fall back to the
+    // existing title-based grouping for those).
+    let mut entries: Vec<(String, Option<String>)> = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for k in diag.contract_states.keys() {
-        let s = k.to_string();
-        if seen.insert(s.clone()) {
-            keys.push(s);
+        let inst = k.encoded_contract_id();
+        if seen.insert(inst.clone()) {
+            entries.push((inst, Some(k.encoded_code_hash())));
         }
     }
     if let Some(h) = hosting {
         for entry in &h.my_hosted {
             if seen.insert(entry.contract_key.clone()) {
-                keys.push(entry.contract_key.clone());
+                entries.push((entry.contract_key.clone(), None));
             }
         }
     }
     for s in &diag.subscriptions {
         let key = s.contract_key.to_string();
         if seen.insert(key.clone()) {
-            keys.push(key);
+            entries.push((key, None));
         }
     }
 
@@ -288,11 +306,11 @@ fn build_payload(
     // name and the "✓ web" badge without doing any HTTP themselves.
     // Keys we haven't probed yet (or that timed out transiently) ship
     // bare — the dashboard treats `None` as "unknown".
-    let contracts: Vec<String> = keys
+    let contracts: Vec<String> = entries
         .into_iter()
-        .map(|k| {
+        .map(|(k, code_hash)| {
             let r = probe_cache.get(&k).unwrap_or_default();
-            encode_contract_entry(&k, r.is_webapp, r.title.as_deref())
+            encode_contract_entry(&k, r.is_webapp, r.title.as_deref(), code_hash.as_deref())
         })
         .collect();
 
@@ -528,7 +546,7 @@ async fn main() -> Result<()> {
             &sk,
             instance,
             code_hash,
-            cli.label.as_deref(),
+            cli.display_name.as_deref(),
             &fallback_neighbors,
             &mut diagnostics_supported,
             &http_host,

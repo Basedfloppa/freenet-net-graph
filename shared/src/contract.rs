@@ -197,31 +197,68 @@ impl ContractState {
 
 /// Encode a contract entry for [`EntryPayload::contracts`].
 ///
-/// Wire format:
-/// - `<base58>` — no probe data (legacy, skeleton publisher, or probe failed).
+/// Wire format (suffix-based, `|`-delimited; segments may appear in any
+/// order, unknown segments are ignored — keeps decoder forward-compatible):
+/// - `<base58>` — bare key, no metadata (skeleton publisher / probe failed).
 /// - `<base58>|w` — daemon-confirmed webapp, no title.
 /// - `<base58>|w|t=<pct>` — webapp with title; `<pct>` is percent-encoded.
 /// - `<base58>|d` — daemon-confirmed *not* a webapp (data-only contract).
+/// - `<base58>|c=<base58_hash>` — code hash (the WASM contract's content
+///   hash). Two contract entries sharing this value are *guaranteed* to
+///   run the same code — they're the same app. Subscribers use it as the
+///   primary grouping key so different titles for one app, or one title
+///   coincidentally shared by different apps, both resolve correctly.
+/// - Combinable: `<base58>|c=<hash>|w|t=<title>` is a webapp entry with
+///   both code hash and friendly title attached.
 ///
 /// Base58 keys never contain `|`, so the delimiter is unambiguous.
-pub fn encode_contract_entry(key: &str, is_webapp: Option<bool>, title: Option<&str>) -> String {
-    match is_webapp {
-        Some(true) => match title.filter(|t| !t.trim().is_empty()) {
-            Some(t) => format!("{key}|w|t={}", pct_encode(t)),
-            None => format!("{key}|w"),
-        },
-        Some(false) => format!("{key}|d"),
-        None => key.to_string(),
+pub fn encode_contract_entry(
+    key: &str,
+    is_webapp: Option<bool>,
+    title: Option<&str>,
+    code_hash: Option<&str>,
+) -> String {
+    let mut out = String::with_capacity(key.len() + 64);
+    out.push_str(key);
+    if let Some(c) = code_hash.map(str::trim).filter(|c| !c.is_empty()) {
+        out.push_str("|c=");
+        out.push_str(c);
     }
+    match is_webapp {
+        Some(true) => {
+            out.push_str("|w");
+            if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
+                out.push_str("|t=");
+                out.push_str(&pct_encode(t));
+            }
+        }
+        Some(false) => out.push_str("|d"),
+        None => {}
+    }
+    out
 }
 
-/// Inverse of [`encode_contract_entry`]. Returns `(key, is_webapp, title)`.
-/// A bare base58 key returns `(key, None, None)`. Unknown segments are ignored.
-pub fn decode_contract_entry(s: &str) -> (String, Option<bool>, Option<String>) {
+/// Decoded contract entry. `key` is the base58 contract instance id;
+/// `code_hash` is the WASM content hash when the publisher shipped one
+/// (newer daemons). Unknown segments are dropped, so older publishers
+/// stay forward-compatible.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DecodedContractEntry {
+    pub key: String,
+    pub is_webapp: Option<bool>,
+    pub title: Option<String>,
+    pub code_hash: Option<String>,
+}
+
+/// Inverse of [`encode_contract_entry`]. Bare base58 key decodes to
+/// `{ key, None, None, None }`. Unknown segments are ignored — that's
+/// what lets us add suffixes without coordinated subscriber upgrades.
+pub fn decode_contract_entry(s: &str) -> DecodedContractEntry {
     let mut parts = s.split('|');
     let key = parts.next().unwrap_or("").to_string();
     let mut is_webapp: Option<bool> = None;
     let mut title: Option<String> = None;
+    let mut code_hash: Option<String> = None;
     for part in parts {
         if part == "w" {
             is_webapp = Some(true);
@@ -232,9 +269,14 @@ pub fn decode_contract_entry(s: &str) -> (String, Option<bool>, Option<String>) 
             if !decoded.is_empty() {
                 title = Some(decoded);
             }
+        } else if let Some(rest) = part.strip_prefix("c=") {
+            let trimmed = rest.trim();
+            if !trimmed.is_empty() {
+                code_hash = Some(trimmed.to_string());
+            }
         }
     }
-    (key, is_webapp, title)
+    DecodedContractEntry { key, is_webapp, title, code_hash }
 }
 
 /// Minimal percent-encoder: alphanumerics and `- _ . ~` pass through; ` ` →
@@ -443,36 +485,54 @@ mod tests {
     fn contract_entry_roundtrip() {
         // bare key, untouched by encoder when no probe data
         let bare = "BRQiAyN4VSWRp6sW6Xvt2B6RmHyp6dQFFZhStvpnLUkE";
-        assert_eq!(encode_contract_entry(bare, None, None), bare);
-        assert_eq!(decode_contract_entry(bare), (bare.to_string(), None, None));
+        assert_eq!(encode_contract_entry(bare, None, None, None), bare);
+        let d = decode_contract_entry(bare);
+        assert_eq!(d.key, bare);
+        assert_eq!(d.is_webapp, None);
+        assert_eq!(d.title, None);
+        assert_eq!(d.code_hash, None);
 
         // webapp without title
-        let enc = encode_contract_entry(bare, Some(true), None);
+        let enc = encode_contract_entry(bare, Some(true), None, None);
         assert_eq!(enc, format!("{bare}|w"));
-        assert_eq!(
-            decode_contract_entry(&enc),
-            (bare.to_string(), Some(true), None)
-        );
+        let d = decode_contract_entry(&enc);
+        assert_eq!(d.is_webapp, Some(true));
+        assert_eq!(d.title, None);
 
         // webapp with title — spaces, unicode, special chars
         let title = "Net-Graph Dashboard / 网络图 v1.0";
-        let enc = encode_contract_entry(bare, Some(true), Some(title));
-        let (k, w, t) = decode_contract_entry(&enc);
-        assert_eq!(k, bare);
-        assert_eq!(w, Some(true));
-        assert_eq!(t.as_deref(), Some(title));
+        let enc = encode_contract_entry(bare, Some(true), Some(title), None);
+        let d = decode_contract_entry(&enc);
+        assert_eq!(d.key, bare);
+        assert_eq!(d.is_webapp, Some(true));
+        assert_eq!(d.title.as_deref(), Some(title));
 
         // data-only contract
-        let enc = encode_contract_entry(bare, Some(false), None);
+        let enc = encode_contract_entry(bare, Some(false), None, None);
         assert_eq!(enc, format!("{bare}|d"));
-        assert_eq!(
-            decode_contract_entry(&enc),
-            (bare.to_string(), Some(false), None)
-        );
+        let d = decode_contract_entry(&enc);
+        assert_eq!(d.is_webapp, Some(false));
 
         // empty title falls back to no-title encoding
-        let enc = encode_contract_entry(bare, Some(true), Some("   "));
+        let enc = encode_contract_entry(bare, Some(true), Some("   "), None);
         assert_eq!(enc, format!("{bare}|w"));
+
+        // code hash round-trip (the new field)
+        let code = "7ebvjngtateejbke3trhq9vsidpi8ex7akwzfhwtf13r";
+        let enc = encode_contract_entry(bare, Some(true), Some("App"), Some(code));
+        let d = decode_contract_entry(&enc);
+        assert_eq!(d.key, bare);
+        assert_eq!(d.code_hash.as_deref(), Some(code));
+        assert_eq!(d.is_webapp, Some(true));
+        assert_eq!(d.title.as_deref(), Some("App"));
+
+        // forward-compatibility: a future suffix is silently ignored.
+        let future = format!("{bare}|c={code}|w|t={}|future=blah", pct_encode("App"));
+        let d = decode_contract_entry(&future);
+        assert_eq!(d.key, bare);
+        assert_eq!(d.code_hash.as_deref(), Some(code));
+        assert_eq!(d.is_webapp, Some(true));
+        assert_eq!(d.title.as_deref(), Some("App"));
     }
 
     #[test]

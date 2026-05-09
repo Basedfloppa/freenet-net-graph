@@ -27,6 +27,31 @@ html, body {
 
 #app { display: flex; flex-direction: column; height: 100vh; }
 
+/* Default <a> styling for content links (`.hint` paragraphs,
+   `.empty-hint` body, drilldown text). Browser defaults render
+   `link blue` / `visited purple` against the dark background and
+   are barely readable — we lift to the brand accent so contrast
+   passes for both states, and disable the visited-color flip for
+   consistency. UI-affordance links (like `.repo-link` in the
+   footer or `.contract-open-btn` "↗") carry their own class and
+   match this on `[class]`, so they keep their bespoke styling. */
+a:not([class]),
+a:not([class]):visited {
+    color: var(--accent);
+    text-decoration: none;
+    border-bottom: 1px dashed rgba(247, 140, 31, 0.45);
+    transition: border-bottom-color 100ms;
+}
+a:not([class]):hover {
+    border-bottom-style: solid;
+    border-bottom-color: var(--accent);
+}
+a:not([class]):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 2px;
+}
+
 header {
     display: flex; align-items: center; gap: 16px;
     padding: 10px 18px;
@@ -91,7 +116,41 @@ aside h2 { font-size: 12px; text-transform: uppercase; color: var(--fg-muted); m
 .gw-card .err-msg { color: var(--err); font-size: 11px; margin-top: 6px; word-break: break-word; }
 
 .graph-wrap { position: relative; min-width: 0; min-height: 0; }
-svg.graph { width: 100%; height: 100%; display: block; }
+svg.graph {
+    width: 100%;
+    height: 100%;
+    display: block;
+    cursor: grab;
+    /* Block the browser's default touch-scroll/pinch on the SVG so our
+       wheel/drag handlers run instead. Without this, two-finger
+       trackpad scrolling moves the page instead of the graph. */
+    touch-action: none;
+    user-select: none;
+}
+svg.graph.graph-grabbing { cursor: grabbing; }
+
+/* Floating "reset view" chip in the bottom-left of the graph canvas.
+   Hidden until the user has actually panned/zoomed (parent component
+   conditionally renders) so first-paint stays clean. Top-right is
+   already taken by the publisher drilldown panel. */
+.graph-reset-view {
+    position: absolute;
+    bottom: 12px;
+    left: 12px;
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    color: var(--fg);
+    border-radius: 5px;
+    padding: 4px 10px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    line-height: 1;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.25);
+    z-index: 4;
+    transition: color 100ms, border-color 100ms, background 100ms;
+}
+.graph-reset-view:hover { color: var(--accent); border-color: var(--accent); }
 
 .empty-hint {
     position: absolute;
@@ -127,6 +186,21 @@ svg.graph { width: 100%; height: 100%; display: block; }
 .node-public-gw { fill: var(--public-gw); stroke: #fff; stroke-width: 2px; stroke-dasharray: 3 2; }
 .node-peer { fill: var(--peer); stroke: #fff; stroke-width: 1px; }
 .node-floating { fill: #6b7280; stroke: #aaa; stroke-width: 1px; stroke-dasharray: 2 2; }
+
+/* Hover affordance for draggable circles. SVG circles don't get the
+   parent SVG's `cursor: grab` because cursor is per-element; spell it
+   out so the user knows a node is interactive. The fallback `pointer`
+   is kept on the bare class set so any older path without `:hover`
+   support still gets *some* clickable hint. */
+.node-gw, .node-public-gw, .node-peer, .node-floating {
+    cursor: grab;
+}
+svg.graph.graph-grabbing .node-gw,
+svg.graph.graph-grabbing .node-public-gw,
+svg.graph.graph-grabbing .node-peer,
+svg.graph.graph-grabbing .node-floating {
+    cursor: grabbing;
+}
 
 .node-label { fill: var(--fg); font-size: 10px; pointer-events: none; }
 .node-label-gw {
@@ -529,6 +603,223 @@ line.edge-dimmed   { opacity: 0.06; transition: opacity 200ms ease; }
     white-space: nowrap;
 }
 .publisher-drilldown .row-tag-stale { font-size: 10px; }
+
+/* Facet chips bar (Contracts tab). Stable 3-row layout: kind /
+   count / ≥subs each on its own line. Earlier we tried flex-wrap to
+   pair rows up when the sidebar got wide, but the wrapping made
+   chips visually jump between rows on every resize — distracting,
+   and chips that didn't fit on a row split mid-row inside their
+   facet-row. Now we lock everything to no-wrap and stick to top. */
+.facet-rows {
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 auto;
+    gap: 4px;
+    margin: 6px 0 4px;
+}
+.facet-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 0 0 auto;
+    /* `nowrap` keeps every chip on the same line as its label.
+       When the sidebar is too narrow to fit them all, the rightmost
+       chip overflows horizontally rather than breaking to a new
+       row — predictable layout beats reflow-on-every-pixel. */
+    flex-wrap: nowrap;
+    min-width: 0;
+}
+.facet-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--fg-muted);
+    width: 44px;
+    flex: 0 0 auto;
+}
+.facet-chip {
+    background: transparent;
+    border: 1px solid var(--panel-border);
+    color: var(--fg-muted);
+    border-radius: 999px;
+    padding: 1px 9px;
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    line-height: 1.4;
+    transition: color 80ms, border-color 80ms, background 80ms;
+}
+.facet-chip:hover { color: var(--fg); border-color: var(--fg-muted); }
+.facet-chip.active {
+    color: var(--bg);
+    background: var(--accent);
+    border-color: var(--accent);
+}
+
+/* Sort dropdown row. Sits as a direct child of the column-flex
+   `aside` — `flex: 0 0 auto` is the explicit "size to content"
+   so it doesn't get caught by any inherited grow rule. The earlier
+   `flex: 1 1 200px` was meant for a hypothetical row-flex container
+   that never materialised; in a column container it stretched the
+   row vertically to ~350 px. */
+.sort-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 6px 0;
+    flex: 0 0 auto;
+    min-width: 0;
+}
+.sort-label {
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    color: var(--fg-muted);
+    width: 44px;
+    flex: 0 0 auto;
+}
+.sort-select {
+    flex: 1;
+    background: var(--bg);
+    color: var(--fg);
+    border: 1px solid var(--panel-border);
+    border-radius: 4px;
+    padding: 3px 6px;
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+.sort-select:hover { border-color: var(--fg-muted); }
+
+/* Active publisher-filter pill */
+.active-filter {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(247, 140, 31, 0.10);
+    border: 1px solid rgba(247, 140, 31, 0.5);
+    color: var(--fg);
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+    margin: 6px 0;
+}
+.active-filter b { color: var(--accent); font-weight: 600; }
+.active-filter-clear {
+    margin-left: auto;
+    background: transparent;
+    border: none;
+    color: var(--fg-muted);
+    cursor: pointer;
+    font: inherit;
+    line-height: 1;
+}
+.active-filter-clear:hover { color: var(--accent); }
+
+/* Result count line ("12 of 624 • filtered") */
+.result-count {
+    color: var(--fg-muted);
+    font-size: 11px;
+    margin: 4px 0 6px;
+}
+.result-count-modifier { color: var(--accent); }
+
+/* Collapsible group headers. The outer `.contract-groups` is the
+   single scroll container — without this, multiple inner `.node-list`s
+   (one per group) each tried to claim `flex: 1` and the page itself
+   started scrolling instead. We disable child scroll & visual chrome
+   on per-group `.node-list` so the one-and-only scroll lives here. */
+.contract-groups {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    background: #14171f;
+}
+.contract-group .node-list {
+    flex: 0 0 auto;
+    overflow: visible;
+    border: none;
+    background: transparent;
+    border-radius: 0;
+    min-height: 0;
+}
+.contract-group-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    background: transparent;
+    border: none;
+    border-top: 1px solid var(--panel-border);
+    color: var(--fg-muted);
+    font: inherit;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 6px 4px;
+    cursor: pointer;
+    text-align: left;
+}
+.contract-group-header:hover { color: var(--fg); }
+.contract-group-chevron { font-size: 10px; width: 12px; flex: 0 0 auto; }
+.contract-group-label { flex: 1; }
+.contract-group-count { color: var(--fg-muted); font-weight: 400; }
+
+/* Substring highlight in matched rows */
+mark.hl {
+    background: rgba(247, 140, 31, 0.30);
+    color: inherit;
+    border-radius: 2px;
+    padding: 0 1px;
+}
+
+/* Code-hash badge — six-char monospace prefix with a hex token icon. */
+.code-hash-badge {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--fg-muted);
+    border: 1px solid rgba(255, 255, 255, 0.10);
+    flex: 0 0 auto;
+}
+/* Multi-version variant — an app whose name matches across multiple
+   distinct code hashes. Highlighted in accent so the version split is
+   discoverable at a glance; hover for the full hash list. */
+.code-hash-badge-multi {
+    background: rgba(247, 140, 31, 0.12);
+    color: var(--accent);
+    border-color: rgba(247, 140, 31, 0.45);
+    font-family: inherit;
+}
+
+/* Drilldown action button (e.g. "Filter contracts by this publisher") */
+.drilldown-action {
+    display: block;
+    width: 100%;
+    margin-top: 10px;
+    background: transparent;
+    border: 1px solid var(--panel-border);
+    color: var(--fg);
+    border-radius: 4px;
+    padding: 6px 8px;
+    font: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    text-align: left;
+    transition: color 100ms, border-color 100ms, background 100ms;
+}
+.drilldown-action:hover {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(247, 140, 31, 0.08);
+}
 
 /* Settings gear button in the header. */
 .header-btn {

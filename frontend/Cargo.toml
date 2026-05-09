@@ -53,5 +53,5 @@ bs58 = "0.5"
 # couldn't be deserialized in the browser and Update payloads couldn't
 # be parsed server-side. Stay on 0.6.1 until nodes upgrade.
 freenet-stdlib = { version = "0.6.1", features = ["net"] }
-web-sys = { version = "0.3", features = ["HtmlInputElement", "HtmlSelectElement", "Navigator", "Clipboard", "Storage", "WebSocket"] }
+web-sys = { version = "0.3", features = ["HtmlInputElement", "HtmlSelectElement", "Navigator", "Clipboard", "Storage", "WebSocket", "Element", "DomRect"] }
 base64 = "0.22.1"
